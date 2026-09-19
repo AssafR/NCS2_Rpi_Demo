@@ -26,7 +26,7 @@ You get a small dictionary with:
 - `res['frame']`: The same input frame (no copy).
 - `res['elapsed_ms']`: Inference time in milliseconds.
 
-Keep “what the model outputs” (runner) separate from “how we draw it” (processor) and “how we serve it” (server) — this makes the lesson easier to follow.
+Keep “what the model outputs” (runner) separate from “how we draw it” (processor) and “how we serve it” (server). This makes the lesson easier to follow.
 
 ## Requirements
 
@@ -45,7 +45,7 @@ python3 -m pip install --upgrade pip
 python3 -m pip install openvino opencv-python numpy
 ```
 
-> Note: On Raspberry Pi, you may prefer prebuilt wheels from your platform vendor or use OpenVINO’s official install guide if available for your board.
+> Note: On Raspberry Pi, you can also use prebuilt packages from your vendor or follow OpenVINO’s install guide for your board.
 
 ## Run it
 
@@ -83,8 +83,7 @@ What it does:
 - Draws the pose and friendly overlays on the frame
 - Shows the frame in a window (press ESC to quit)
 
-If you prefer to write it yourself, see the Quickstart snippet in
-`pose_model_runner.py`.
+If you prefer to write it yourself, see the Quickstart in `pose_model_runner.py`.
 
 ## Glossary (for students)
 

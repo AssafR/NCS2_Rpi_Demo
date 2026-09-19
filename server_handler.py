@@ -2,16 +2,16 @@
 server_handler.py
 -----------------
 
-Beginner-friendly HTTP handler factory. This module intentionally keeps
-network concerns separate from model execution and visualization.
+Simple HTTP handler factory. This file keeps the web server code separate
+from the model code and the drawing code.
 
-It serves:
-- "/"           → the main static HTML page from the provided static_dir
-- "/static/..." → CSS/JS/assets from static_dir
-- "/video"      → MJPEG stream of JPEG-encoded frames (latest_jpeg)
-- "/device"     → signals a device change (CPU/MYRIAD) via a callback
+Routes we serve:
+- "/"            → main static HTML page (from static_dir)
+- "/static/..."  → CSS/JS/assets (from static_dir)
+- "/video"       → MJPEG stream of JPEG images (latest frame)
+- "/device"      → ask the app to switch device (CPU or MYRIAD)
 
-This separation helps students see: "web server" vs "model" vs "drawing".
+This separation makes it easier to learn: web server vs model vs drawing.
 """
 
 import os

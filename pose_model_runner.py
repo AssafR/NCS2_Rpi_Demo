@@ -5,9 +5,9 @@ pose_model_runner.py
 Beginner-friendly wrapper around an OpenVINO pose-estimation model.
 
 This module is responsible ONLY for:
-- Loading the model and compiling it for a target device (CPU / MYRIAD)
+- Loading the model and compiling it for a target device (CPU or MYRIAD)
 - Preparing input frames and running inference
-- Returning structured, model-agnostic results that other code can consume
+- Returning simple results that other code can use
 
 It does NOT draw on images or serve HTTP. That separation keeps lessons clear:
 - "Model execution" (here)
@@ -20,8 +20,12 @@ Quickstart (model-only):
     from pose_result_processor import render_pose_on_frame, annotate_metrics
     import cv2
 
-    runner = PoseModelRunner("model/human-pose-estimation-0001.xml",
-                             initial_device="CPU", model_w=456, model_h=256)
+    runner = PoseModelRunner(
+        "model/human-pose-estimation-0001.xml",
+        initial_device="CPU",
+        model_w=456,
+        model_h=256,
+    )
     cap = cv2.VideoCapture(0)
     while True:
         ok, frame = cap.read()
