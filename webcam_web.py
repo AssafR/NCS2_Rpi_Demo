@@ -106,14 +106,15 @@ requested_device = None
 # =========================================================
 
 def inference_loop():
-    """Capture → infer → visualize → encode loop.
+    """Capture → infer → visualize → compress (JPEG) loop.
 
     Student roadmap for this loop:
     1) Read a frame from the webcam
     2) Check if a device switch was requested and apply it here (single writer)
     3) Ask the model runner to run inference and return results
     4) Draw the pose and friendly overlays using visualization helpers
-    5) Encode to JPEG and publish for the HTTP streamer
+     5) Compress the frame to JPEG (image compression, not a neural network)
+         and publish it for the HTTP streamer
     """
     global latest_jpeg
     global requested_device
@@ -179,15 +180,15 @@ def inference_loop():
         #   - res['elapsed_ms']: inference time in milliseconds
         res = runner.run(frame_for_processing)
 
-        # Draw the skeleton using the decoded keypoints (visualization step).
         device_name = res["device"]
         inference_ms = res["elapsed_ms"]
 
+        # Draw the skeleton using the decoded keypoints (visualization step).
         points = res["points"]
         render_pose_on_frame(frame_for_processing, points)
+
         # Update FPS calculations (simple approach using elapsed time)
         now = time.perf_counter()
-
         loop_time = now - last_frame_time
         last_frame_time = now
         instant_loop_fps = 1.0 / loop_time if loop_time > 0 else 0.0
@@ -210,6 +211,7 @@ def inference_loop():
             smoothed_loop_fps,
         )
 
+        # Compress the annotated frame to JPEG for streaming over HTTP
         success, jpeg = cv2.imencode(
             ".jpg",
             frame_for_processing,
@@ -221,45 +223,75 @@ def inference_loop():
                 latest_jpeg = jpeg.tobytes()
 
 
-## HTML UI is now served from the static directory
-
-
-## HTTP request handling moved to server_handler.create_handler
-
-
 # =========================================================
 # Start
 # =========================================================
+# We launch the background inference loop (produces JPEGs), then build an
+# HTTP request handler by providing tiny callback functions below. This keeps
+# the web server unaware of model internals and makes the wiring explicit.
 
-worker = threading.Thread(
-    target=inference_loop,
-    daemon=True
-)
+def main():
+    """Program entry point: set up worker thread and HTTP server once.
 
-worker.start()
+    Student note:
+    - Putting startup code inside main() (and guarding with
+      `if __name__ == "__main__":`) ensures this only runs once when you run
+      the script, and not each time the module is imported elsewhere.
+    """
+    worker = threading.Thread(target=inference_loop, daemon=True)
+    worker.start()
 
-def get_latest_jpeg():
-    """Return the latest encoded JPEG frame for the /video stream."""
-    with frame_lock:
-        return latest_jpeg
+    # CALLBACKS (student note)
+    # ------------------------
+    # A "callback" is a function we pass to another piece of code so that it
+    # can call us back later at the right moment. Here, we pass three small
+    # callbacks to the HTTP server factory:
+    #   - get_latest_jpeg(): how the server asks us for the newest video frame
+    #   - request_device_callback(name): how the server tells us which device
+    #       (CPU or MYRIAD) the user requested
+    #   - is_running(): how the server checks whether to keep streaming frames
+    # The server does not know our internal variables; it only knows how to
+    # call these tiny functions. This keeps responsibilities separate and the
+    # program easier to understand and test.
 
-def request_device_callback(name: str):
-    """Signal the inference loop to switch device at a safe point."""
-    global requested_device
-    requested_device = name
+    def get_latest_jpeg():
+        """Return the most recent JPEG bytes for the /video MJPEG stream.
 
-def is_running():
-    """Tell the HTTP streamer whether to continue sending frames."""
-    return running
+        Note:
+        - May return None at startup until the first frame is processed.
+        - The server writes whatever bytes it gets into the HTTP response.
+        """
+        with frame_lock:
+            return latest_jpeg
 
-base_dir = os.path.dirname(__file__)
-static_dir = os.path.join(base_dir, "static")
-Handler = create_handler(static_dir, get_latest_jpeg, request_device_callback, is_running)
+    def request_device_callback(name: str):
+        """Record a requested device (CPU or MYRIAD) from the HTTP handler.
 
-server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
+        Important:
+        - We do NOT switch devices here. We only set a flag.
+        - The inference loop (single writer) will see this flag between frames
+          and call runner.set_device(name) at a safe moment.
+        """
+        global requested_device
+        requested_device = name
 
-print(
-    f"""
+    def is_running():
+        """Return True while the application is active."""
+        return running
+
+    base_dir = os.path.dirname(__file__)
+    static_dir = os.path.join(base_dir, "static")
+    Handler = create_handler(
+        static_dir,
+        get_latest_jpeg,          # how to fetch the latest JPEG bytes
+        request_device_callback,  # how to signal a requested device change
+        is_running,               # how to know when to stop streaming
+    )
+
+    server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
+
+    print(
+        f"""
 ==========================================
 Web demo running
 Port: {WEB_PORT}
@@ -270,25 +302,22 @@ in a browser using port {WEB_PORT}.
 
 Press Ctrl+C to stop.
 """
-)
-
-
-try:
-    server.serve_forever()
-
-except KeyboardInterrupt:
-    print(
-        "\nStopping..."
     )
 
-finally:
-    running = False
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        # Let the loops wind down, then close resources.
+        global running
+        running = False
+        server.shutdown()
+        cap.release()
+        print("Finished.")
 
-    server.shutdown()
-    cap.release()
 
-    print(
-        "Finished."
-    )
+if __name__ == "__main__":
+    main()
 
 
