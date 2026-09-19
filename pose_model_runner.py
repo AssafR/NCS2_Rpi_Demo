@@ -100,6 +100,7 @@ class PoseModelRunner:
         return True
 
     def _prepare_frame(self, frame: object):
+        """Resize + NCHW + float32 conversion for model input."""
         resized = cv2.resize(frame, (self.model_w, self.model_h))
         tensor = resized.transpose(2, 0, 1)
         tensor = tensor[np.newaxis, ...]
@@ -107,6 +108,7 @@ class PoseModelRunner:
         return tensor
 
     def _get_heatmaps(self, result):
+        """Find the 19-channel heatmap tensor among model outputs by shape."""
         for output in self.compiled_model.outputs:
             shape = output.shape
             if len(shape) == 4 and shape[1] == 19:

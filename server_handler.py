@@ -1,3 +1,19 @@
+"""
+server_handler.py
+-----------------
+
+Beginner-friendly HTTP handler factory. This module intentionally keeps
+network concerns separate from model execution and visualization.
+
+It serves:
+- "/"           → the main static HTML page from the provided static_dir
+- "/static/..." → CSS/JS/assets from static_dir
+- "/video"      → MJPEG stream of JPEG-encoded frames (latest_jpeg)
+- "/device"     → signals a device change (CPU/MYRIAD) via a callback
+
+This separation helps students see: "web server" vs "model" vs "drawing".
+"""
+
 import os
 import time
 import mimetypes
@@ -5,7 +21,21 @@ from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 
-def create_handler(static_dir: str, get_latest_jpeg, request_device_callback, is_running):
+def create_handler(static_dir: str,
+                   get_latest_jpeg,
+                   request_device_callback,
+                   is_running):
+    """Create a simple HTTP request handler bound to your app callbacks.
+
+    Args:
+        static_dir: where index.html and /static files live
+        get_latest_jpeg: () -> Optional[bytes], returns most recent JPEG frame
+        request_device_callback: (str) -> None, called with 'CPU' or 'MYRIAD'
+        is_running: () -> bool, tells the streaming loop when to stop
+
+    Returns:
+        A subclass of BaseHTTPRequestHandler you can pass to ThreadingHTTPServer.
+    """
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -55,6 +85,7 @@ def create_handler(static_dir: str, get_latest_jpeg, request_device_callback, is
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                 self.end_headers()
                 try:
+                    # Continuously write JPEG frames in a multipart response
                     while is_running():
                         jpeg = get_latest_jpeg()
                         if jpeg is None:

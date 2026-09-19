@@ -6,7 +6,8 @@ Single source of truth for pose landmark names and connectivity.
 
 Keeping BODY_PARTS and POSE_PAIRS here avoids duplication and makes it easy
 for both the model runner and the visualization code to agree on naming and
-skeletal connections.
+skeletal connections. This is a simplified, OpenPose-like skeleton for a
+single-person classroom demo.
 """
 
 BODY_PARTS = [

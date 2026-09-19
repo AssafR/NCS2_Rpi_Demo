@@ -106,6 +106,15 @@ requested_device = None
 # =========================================================
 
 def inference_loop():
+    """Capture → infer → visualize → encode loop.
+
+    Student roadmap for this loop:
+    1) Read a frame from the webcam
+    2) Check if a device switch was requested and apply it here (single writer)
+    3) Ask the model runner to run inference and return results
+    4) Draw the pose and friendly overlays using visualization helpers
+    5) Encode to JPEG and publish for the HTTP streamer
+    """
     global latest_jpeg
     global requested_device
 
@@ -230,14 +239,17 @@ worker = threading.Thread(
 worker.start()
 
 def get_latest_jpeg():
+    """Return the latest encoded JPEG frame for the /video stream."""
     with frame_lock:
         return latest_jpeg
 
 def request_device_callback(name: str):
+    """Signal the inference loop to switch device at a safe point."""
     global requested_device
     requested_device = name
 
 def is_running():
+    """Tell the HTTP streamer whether to continue sending frames."""
     return running
 
 base_dir = os.path.dirname(__file__)
