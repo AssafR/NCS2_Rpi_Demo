@@ -1,70 +1,58 @@
+"""
+pose_estimation.py (refactored)
+--------------------------------
+
+Beginner note:
+- This module is focused on RUNNING the pose-estimation model only.
+- It should NOT draw on images or smooth FPS/metrics — keep that in a
+    visualization/util module (e.g., pose_result_processor.py) or the caller.
+
+Separation of concerns makes lessons clearer:
+- Model execution (this file): returns structured results (points, heatmaps).
+- Result processing (another file): draws skeletons, overlays text, etc.
+- Web serving (another file): streams JPEG frames, handles HTTP.
+"""
+
 import time
 import threading
 import numpy as np
 import cv2
 from openvino.runtime import Core
+from pose_defs import BODY_PARTS as DEF_BODY_PARTS, POSE_PAIRS as DEF_POSE_PAIRS
 
 
 class PoseEstimator:
     # Pose model definitions
-    BODY_PARTS = [
-        "Nose", "Neck",
-        "RShoulder", "RElbow", "RWrist",
-        "LShoulder", "LElbow", "LWrist",
-        "RHip", "RKnee", "RAnkle",
-        "LHip", "LKnee", "LAnkle",
-        "REye", "LEye", "REar", "LEar"
-    ]
-
-    POSE_PAIRS = [
-        ("Neck", "RShoulder"),
-        ("RShoulder", "RElbow"),
-        ("RElbow", "RWrist"),
-        ("Neck", "LShoulder"),
-        ("LShoulder", "LElbow"),
-        ("LElbow", "LWrist"),
-        ("Neck", "RHip"),
-        ("RHip", "RKnee"),
-        ("RKnee", "RAnkle"),
-        ("Neck", "LHip"),
-        ("LHip", "LKnee"),
-        ("LKnee", "LAnkle"),
-        ("Neck", "Nose"),
-        ("Nose", "REye"),
-        ("REye", "REar"),
-        ("Nose", "LEye"),
-        ("LEye", "LEar"),
-    ]
+    # Use shared constants to keep definitions in one place
+    BODY_PARTS = DEF_BODY_PARTS
+    POSE_PAIRS = DEF_POSE_PAIRS
 
     CONFIDENCE_THRESHOLD = 0.15
 
     def __init__(self,
-                 model_path: str,
-                 initial_device: str = "MYRIAD",
-                 model_w: int = 456,
-                 model_h: int = 256,
-                 camera_w: int = 640,
-                 camera_h: int = 480,
-                 camera_fps: int = 15):
-        self.model_path = model_path
-        self.model_w = model_w
-        self.model_h = model_h
-        self.camera_w = camera_w
-        self.camera_h = camera_h
-        self.camera_fps = camera_fps
-        self.current_device = initial_device
+                                model_path: str,
+                                initial_device: str = "MYRIAD",
+                                model_w: int = 456,
+                                model_h: int = 256):
+            """Initialize a pose-estimation executor.
 
-        self.core = Core()
-        self.model = self.core.read_model(self.model_path)
-        self.compiled_model = None
-        self.model_lock = threading.Lock()
+            Note for students:
+            - Camera configuration (resolution/FPS) belongs to whoever captures
+                frames (e.g., a webcam setup function), not the model executor.
+            - Here we only care about the MODEL's input size (model_w/model_h).
+            """
+            self.model_path = model_path
+            self.model_w = model_w
+            self.model_h = model_h
+            self.current_device = initial_device
 
-        self.last_frame_time = time.perf_counter()
-        self.smoothed_inference_ms = None
-        self.smoothed_loop_fps = None
+            self.core = Core()
+            self.model = self.core.read_model(self.model_path)
+            self.compiled_model = None
+            self.model_lock = threading.Lock()
 
-        # Caches
-        self._prepared_dummy = np.zeros((1, 3, self.model_h, self.model_w), dtype=np.float32)
+            # Caches
+            self._prepared_dummy = np.zeros((1, 3, self.model_h, self.model_w), dtype=np.float32)
 
     def _compile_model(self, device: str):
         start = time.perf_counter()
@@ -110,15 +98,8 @@ class PoseEstimator:
                 points[part_name] = None
         return points
 
-    def _draw_pose(self, frame, points):
-        for part_a, part_b in self.POSE_PAIRS:
-            a = points.get(part_a)
-            b = points.get(part_b)
-            if a is not None and b is not None:
-                cv2.line(frame, (a[0], a[1]), (b[0], b[1]), (0, 255, 255), 3)
-        for point in points.values():
-            if point is not None:
-                cv2.circle(frame, (point[0], point[1]), 5, (0, 0, 255), -1)
+    # Note: drawing/overlays are intentionally NOT in this module. Use
+    # pose_result_processor.render_pose_on_frame(...) for visualization.
 
     def _get_heatmaps(self, result):
         for output in self.compiled_model.outputs:
@@ -128,6 +109,19 @@ class PoseEstimator:
         raise RuntimeError("Could not find the 19-channel heatmap output")
 
     def infer(self, frame):
+        """Run inference on `frame` and return structured results only.
+
+        Returns a dict:
+            {
+                'heatmaps': np.ndarray,   # raw model heatmaps
+                'points': Dict[str, Tuple[int, int, float]],
+                'device': str,            # 'CPU' or 'MYRIAD'
+                'elapsed_ms': float,      # single-pass inference time
+                'frame': np.ndarray       # the same input frame (not copied)
+            }
+
+        No drawing, no JPEG encoding, and no FPS smoothing in this module.
+        """
         if self.compiled_model is None:
             with self.model_lock:
                 self.compiled_model = self._compile_model(self.current_device)
@@ -141,78 +135,13 @@ class PoseEstimator:
             device_name = self.current_device
         inference_ms = (time.perf_counter() - start) * 1000
 
-        if self.smoothed_inference_ms is None:
-            self.smoothed_inference_ms = inference_ms
-        else:
-            self.smoothed_inference_ms = (
-                0.9 * self.smoothed_inference_ms
-                + 0.1 * inference_ms
-            )
-
-        inf_fps = 1000.0 / self.smoothed_inference_ms if self.smoothed_inference_ms > 0 else 0.0
-
         h, w = frame.shape[:2]
         points = self._extract_keypoints(heatmaps, w, h)
-        self._draw_pose(frame, points)
 
-        now = time.perf_counter()
-        loop_time = now - self.last_frame_time
-        self.last_frame_time = now
-        instant_loop_fps = 1.0 / loop_time if loop_time > 0 else 0.0
-        if self.smoothed_loop_fps is None:
-            self.smoothed_loop_fps = instant_loop_fps
-        else:
-            self.smoothed_loop_fps = (
-                0.9 * self.smoothed_loop_fps
-                + 0.1 * instant_loop_fps
-            )
-
-        cv2.putText(
-            frame,
-            f"Device: {device_name}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"Inference: {self.smoothed_inference_ms:.0f} ms",
-            (20, 75),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"Inference FPS: {inf_fps:.2f}",
-            (20, 110),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"Actual loop FPS: {self.smoothed_loop_fps:.2f}",
-            (20, 145),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2
-        )
-
-        success, jpeg = cv2.imencode(
-            ".jpg",
-            frame,
-            [cv2.IMWRITE_JPEG_QUALITY, 80]
-        )
-        if success:
-            return jpeg.tobytes(), device_name
-        else:
-            return None, device_name
+        return {
+            'heatmaps': heatmaps,
+            'points': points,
+            'device': device_name,
+            'elapsed_ms': inference_ms,
+            'frame': frame,
+        }

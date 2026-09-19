@@ -20,6 +20,7 @@ import threading
 import numpy as np
 import cv2
 from openvino.runtime import Core
+from pose_defs import BODY_PARTS as DEF_BODY_PARTS, POSE_PAIRS as DEF_POSE_PAIRS
 
 
 class PoseModelRunner:
@@ -39,60 +40,33 @@ class PoseModelRunner:
     the model "returns" versus how the results are later drawn or served.
     """
     # Pose model definitions (mirrored from the original file)
-    BODY_PARTS = [
-        "Nose", "Neck",
-        "RShoulder", "RElbow", "RWrist",
-        "LShoulder", "LElbow", "LWrist",
-        "RHip", "RKnee", "RAnkle",
-        "LHip", "LKnee", "LAnkle",
-        "REye", "LEye", "REar", "LEar"
-    ]
-
-    POSE_PAIRS = [
-        ("Neck", "RShoulder"),
-        ("RShoulder", "RElbow"),
-        ("RElbow", "RWrist"),
-        ("Neck", "LShoulder"),
-        ("LShoulder", "LElbow"),
-        ("LElbow", "LWrist"),
-        ("Neck", "RHip"),
-        ("RHip", "RKnee"),
-        ("RKnee", "RAnkle"),
-        ("Neck", "LHip"),
-        ("LHip", "LKnee"),
-        ("LKnee", "LAnkle"),
-        ("Neck", "Nose"),
-        ("Nose", "REye"),
-        ("REye", "REar"),
-        ("Nose", "LEye"),
-        ("LEye", "LEar"),
-    ]
+    # Use shared constants to avoid duplication across modules
+    BODY_PARTS = DEF_BODY_PARTS
+    POSE_PAIRS = DEF_POSE_PAIRS
 
     CONFIDENCE_THRESHOLD = 0.15
 
     def __init__(self,
-                 model_path: str,
-                 initial_device: str = "MYRIAD",
-                 model_w: int = 456,
-                 model_h: int = 256,
-                 camera_w: int = 640,
-                 camera_h: int = 480,
-                 camera_fps: int = 15):
+                                model_path: str,
+                                initial_device: str = "MYRIAD",
+                                model_w: int = 456,
+                                model_h: int = 256):
+        """Initialize the model executor.
+
+        Student note:
+        - Camera configuration (width/height/FPS) belongs to the capture layer.
+            The runner only needs the MODEL's input size (model_w/model_h) and
+            which device to target (CPU or MYRIAD).
+        """
         self.model_path = model_path
         self.model_w = model_w
         self.model_h = model_h
-        self.camera_w = camera_w
-        self.camera_h = camera_h
-        self.camera_fps = camera_fps
         self.current_device = initial_device
 
         self.core = Core()
         self.model = self.core.read_model(self.model_path)
         self.compiled_model = None
         self.model_lock = threading.Lock()
-
-        # Tracking for performance metrics (optional)
-        self.last_frame_time = time.perf_counter()
 
         # Warm-up dummy tensor (not strictly necessary here but keeps parity)
         self._prepared_dummy = np.zeros((1, 3, self.model_h, self.model_w), dtype=np.float32)

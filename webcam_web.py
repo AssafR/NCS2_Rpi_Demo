@@ -18,6 +18,10 @@ from http.server import ThreadingHTTPServer
 import os
 
 import cv2
+# STUDENT NOTE: Model EXECUTION is kept in PoseModelRunner (pose_model_runner.py).
+# It returns raw results (points, heatmaps, device, elapsed_ms). Drawing lives in
+# pose_result_processor.py, and the HTTP server lives in server_handler.py. This
+# separation makes lessons clearer: execution vs visualization vs serving.
 from pose_model_runner import PoseModelRunner
 from pose_result_processor import render_pose_on_frame, annotate_metrics
 from server_handler import create_handler
@@ -52,9 +56,6 @@ runner = PoseModelRunner(
     initial_device="MYRIAD",
     model_w=MODEL_W,
     model_h=MODEL_H,
-    camera_w=CAMERA_W,
-    camera_h=CAMERA_H,
-    camera_fps=CAMERA_FPS
 )
 
 
@@ -170,12 +171,14 @@ def inference_loop():
         res = runner.run(frame_for_processing)
 
         # Draw the skeleton using the decoded keypoints (visualization step).
-        points = res["points"]
-        render_pose_on_frame(frame_for_processing, points)
         device_name = res["device"]
         inference_ms = res["elapsed_ms"]
+
+        points = res["points"]
+        render_pose_on_frame(frame_for_processing, points)
         # Update FPS calculations (simple approach using elapsed time)
         now = time.perf_counter()
+
         loop_time = now - last_frame_time
         last_frame_time = now
         instant_loop_fps = 1.0 / loop_time if loop_time > 0 else 0.0

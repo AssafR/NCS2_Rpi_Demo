@@ -11,36 +11,7 @@ students see the difference between "what the model outputs" and
 
 import cv2
 import numpy as np
-
-# Default pose pairs matching the model's BODY_PARTS order (copied from the runner)
-POSE_PAIRS = [
-    ("Neck", "RShoulder"),
-    ("RShoulder", "RElbow"),
-    ("RElbow", "RWrist"),
-    ("Neck", "LShoulder"),
-    ("LShoulder", "LElbow"),
-    ("LElbow", "LWrist"),
-    ("Neck", "RHip"),
-    ("RHip", "RKnee"),
-    ("RKnee", "RAnkle"),
-    ("Neck", "LHip"),
-    ("LHip", "LKnee"),
-    ("LKnee", "LAnkle"),
-    ("Neck", "Nose"),
-    ("Nose", "REye"),
-    ("REye", "REar"),
-    ("Nose", "LEye"),
-    ("LEye", "LEar"),
-]
-
-BODY_PARTS = [
-    "Nose", "Neck",
-    "RShoulder", "RElbow", "RWrist",
-    "LShoulder", "LElbow", "LWrist",
-    "RHip", "RKnee", "RAnkle",
-    "LHip", "LKnee", "LAnkle",
-    "REye", "LEye", "REar", "LEar"
-]
+from pose_defs import POSE_PAIRS  # Shared source of truth for skeleton edges
 
 def render_pose_on_frame(frame, points, color=(0, 255, 0)):
     """Draw a simple stick-figure skeleton and joints onto `frame`.
