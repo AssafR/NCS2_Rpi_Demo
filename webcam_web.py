@@ -27,7 +27,7 @@ from pose_result_processor import render_pose_on_frame, annotate_metrics
 from server_handler import create_handler
 
 
-# Pose estimation is now implemented in a separate module: pose_estimation.PoseEstimator
+# Pose estimation execution lives in PoseModelRunner (pose_model_runner.py)
 
 
 # =========================================================

@@ -82,7 +82,6 @@ python3 webcam_web.py
 
 - `webcam_web.py` — Camera + inference loop + HTTP server wiring (no HTML inside).
 - `pose_model_runner.py` — OpenVINO model load/compile/run; returns results (points, heatmaps, device, elapsed).
-- `pose_estimation.py` — Compatibility shim: re-exports `PoseModelRunner` as `PoseEstimator` for older lessons.
 - `pose_result_processor.py` — Draw skeleton and overlays; build/overlay a grayscale mask.
 - `server_handler.py` — Serves `/`, `/static/...`, `/video`, and `/device?name=...`.
 - `static/` — Contains `index.html` and small JS for device switching.
