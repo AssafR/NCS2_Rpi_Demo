@@ -7,6 +7,8 @@ import os
 
 import cv2
 import numpy as np
+import threading
+model_lock = threading.Lock()
 from pose_model_runner import PoseModelRunner
 from pose_result_processor import render_pose_on_frame, create_pose_mask
 
@@ -86,6 +88,8 @@ latest_jpeg = None
 frame_lock = threading.Lock()
 
 running = True
+# Device change requests are signaled by HTTP handler; applied safely in the inference thread
+requested_device = None
 
 
 # =========================================================
@@ -180,8 +184,7 @@ def get_heatmaps(result, compiled):
 
 def inference_loop():
     global latest_jpeg
-    global current_device
-    global compiled_model
+    global requested_device
 
     smoothed_inference_ms = None
     smoothed_loop_fps = None
@@ -201,6 +204,14 @@ def inference_loop():
             time.sleep(0.1)
             continue
 
+        # Apply any pending device switch request here (single-writer pattern)
+        if requested_device is not None:
+            to_set = requested_device
+            requested_device = None
+            print(f"\nApplying device switch to: {to_set}...")
+            ok = runner.set_device(to_set)
+            print("Switch successful." if ok else "Switch failed.")
+
         tensor, frame_for_processing = None, frame
         # Use the new PoseModelRunner to execute and obtain results
         res = runner.run(frame_for_processing)
@@ -210,10 +221,6 @@ def inference_loop():
         heatmaps = res["heatmaps"]
         device_name = res["device"]
         inference_ms = res["elapsed_ms"]
-        # Overlay timing information
-        if 'inference_ms' not in locals():
-            pass
-
         # Update FPS calculations (simple approach using elapsed time)
         now = time.perf_counter()
         loop_time = now - last_frame_time
@@ -227,7 +234,10 @@ def inference_loop():
                 + 0.1 * instant_loop_fps
             )
 
-        # Overlay text using device_name and inference_ms
+        # Compute instantaneous inference FPS from the last inference time
+        inference_fps = (1000.0 / inference_ms) if inference_ms > 0 else 0.0
+
+        # Overlay text using device_name and timings
         cv2.putText(
             frame_for_processing,
             f"Device: {device_name}",
@@ -250,7 +260,7 @@ def inference_loop():
 
         cv2.putText(
             frame_for_processing,
-            f"Inference FPS: {smoothed_loop_fps:.2f}",
+            f"Inference FPS: {inference_fps:.2f}",
             (20, 110),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -387,8 +397,7 @@ class Handler(
 ):
 
     def do_GET(self):
-        global current_device
-        global compiled_model
+        # Device selection handled via runner
 
         parsed = urlparse(
             self.path
@@ -484,25 +493,15 @@ class Handler(
                 self.end_headers()
                 return
 
-            # Get current device under lock for race safety
-            with model_lock:
-                old_device = current_device
-
-            if requested != old_device:
-                print(f"\nSwitching to {requested}...")
-                # Compile outside the lock to avoid blocking other requests
-                new_compiled = compile_model(requested)
-
-                with model_lock:
-                    compiled_model = new_compiled
-                    current_device = requested
-
-                print(f"Now using {requested}")
+            # Signal the inference thread to switch devices at a safe point
+            global requested_device
+            requested_device = requested
+            print(f"Device switch requested: {requested}")
 
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write((f"Using {current_device}").encode())
+            self.wfile.write((f"Switching to {requested}").encode())
 
         # ---------------------------------------------
         # Static assets (CSS/JS)
