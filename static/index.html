@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <title>Raspberry Pi Neural Accelerator Demo</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #111;
+      color: white;
+      text-align: center;
+      margin: 30px;
+    }
+    h1 { font-size: 28px; }
+    img { max-width: 90%; border: 2px solid #555; margin-top: 20px; }
+    button { font-size: 22px; padding: 12px 30px; margin: 15px; cursor: pointer; }
+    .note { color: #aaa; margin-top: 10px; }
+  </style>
+</head>
+
+<body>
+  <h1>Raspberry Pi 3 + Neural Accelerator</h1>
+  <div>
+    <button onclick="setDevice('CPU')">Raspberry Pi CPU</button>
+    <button onclick="setDevice('MYRIAD')">Intel NCS2</button>
+  </div>
+  <div class="note">Same CNN. Same camera. Different inference hardware.</div>
+  <img src="/video" alt="Video stream" />
+  <script src="/static/js/app.js"></script>
+</body>
+
+</html>
