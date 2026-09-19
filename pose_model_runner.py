@@ -1,3 +1,20 @@
+"""
+pose_model_runner.py
+--------------------
+
+Beginner-friendly wrapper around an OpenVINO pose-estimation model.
+
+This module is responsible ONLY for:
+- Loading the model and compiling it for a target device (CPU / MYRIAD)
+- Preparing input frames and running inference
+- Returning structured, model-agnostic results that other code can consume
+
+It does NOT draw on images or serve HTTP. That separation keeps lessons clear:
+- "Model execution" (here)
+- "Result processing / visualization" (pose_result_processor.py)
+- "Web serving" (server_handler.py used by webcam_web.py)
+"""
+
 import time
 import threading
 import numpy as np
@@ -6,6 +23,21 @@ from openvino.runtime import Core
 
 
 class PoseModelRunner:
+    """Run a pose-estimation model and return structured results.
+
+    Typical usage in the inference loop:
+
+        res = runner.run(frame)
+        # 'res' is a dictionary with several useful fields:
+        #   - 'heatmaps': raw model heatmaps (19 channels for body parts)
+        #   - 'points'  : decoded keypoints as a dict: name -> (x, y, confidence)
+        #   - 'device'  : the device used for inference (e.g. 'CPU' or 'MYRIAD')
+        #   - 'frame'   : the same input frame (not copied)
+        #   - 'elapsed_ms': wall-clock inference time in milliseconds
+
+    Keep this class focused on execution so students can clearly see what
+    the model "returns" versus how the results are later drawn or served.
+    """
     # Pose model definitions (mirrored from the original file)
     BODY_PARTS = [
         "Nose", "Neck",
@@ -74,6 +106,12 @@ class PoseModelRunner:
         return compiled
 
     def set_device(self, device: str) -> bool:
+        """Compile and switch the active device.
+
+        For simplicity, this compiles on demand when switching.
+        Returns True on success; False if the device string is invalid
+        or compilation fails.
+        """
         if device not in ("CPU", "MYRIAD"):
             return False
         if device == self.current_device:
@@ -102,6 +140,12 @@ class PoseModelRunner:
         raise RuntimeError("Could not find the 19-channel heatmap output")
 
     def _extract_keypoints(self, heatmaps, frame_width, frame_height):
+        """Convert heatmaps to a simple set of single-person keypoints.
+
+        This is a "strongest-activation" approach for classroom demos.
+        It ignores PAFs (part affinity fields) and multi-person decoding
+        to keep the lesson focused and readable.
+        """
         points = {}
         heatmaps = heatmaps[0]
         for i, part_name in enumerate(self.BODY_PARTS):
@@ -116,6 +160,15 @@ class PoseModelRunner:
         return points
 
     def run(self, frame: object):
+        """Run one inference pass on the given BGR `frame`.
+
+        Returns: dict with keys
+            - 'heatmaps': np.ndarray, model heatmaps (shape depends on model)
+            - 'points'  : Dict[str, Tuple[int, int, float]] of keypoints
+            - 'device'  : str, the device used for inference
+            - 'frame'   : the same input frame
+            - 'elapsed_ms': float, inference time in milliseconds
+        """
         if self.compiled_model is None:
             with self.model_lock:
                 self.compiled_model = self._compile_model(self.current_device)

@@ -1,16 +1,26 @@
+"""
+webcam_web.py
+-------------
+
+High-level script that:
+- Captures frames from the camera
+- Asks the PoseModelRunner to run the model
+- Uses pose_result_processor utilities to draw results and overlays
+- Streams the annotated frames via an HTTP server (created by server_handler)
+
+This file intentionally avoids model internals and HTML content to keep the
+lesson focused on "glue code" and system wiring.
+"""
+
 import time
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
-import mimetypes
+from http.server import ThreadingHTTPServer
 import os
 
 import cv2
-import numpy as np
-import threading
-model_lock = threading.Lock()
 from pose_model_runner import PoseModelRunner
-from pose_result_processor import render_pose_on_frame, create_pose_mask
+from pose_result_processor import render_pose_on_frame, annotate_metrics
+from server_handler import create_handler
 
 
 # Pose estimation is now implemented in a separate module: pose_estimation.PoseEstimator
@@ -49,35 +59,30 @@ runner = PoseModelRunner(
 
 
 # =========================================================
+# Webcam setup helper
+# =========================================================
+
+def setup_webcam(camera_id: int, width: int, height: int, fps: int):
+    """Create and configure a VideoCapture for the given camera.
+
+    For students: this is separate from the inference loop so you can clearly
+    see the camera configuration in one place.
+    """
+    cap = cv2.VideoCapture(camera_id, cv2.CAP_V4L2)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open webcam")
+    print("Webcam opened successfully.")
+    return cap
+
+
+# =========================================================
 # Webcam setup
 # =========================================================
 
-cap = cv2.VideoCapture(
-    CAMERA_ID,
-    cv2.CAP_V4L2
-)
-
-cap.set(
-    cv2.CAP_PROP_FRAME_WIDTH,
-    CAMERA_W
-)
-
-cap.set(
-    cv2.CAP_PROP_FRAME_HEIGHT,
-    CAMERA_H
-)
-
-cap.set(
-    cv2.CAP_PROP_FPS,
-    CAMERA_FPS
-)
-
-if not cap.isOpened():
-    raise RuntimeError(
-        "Could not open webcam"
-    )
-
-print("Webcam opened successfully.")
+cap = setup_webcam(CAMERA_ID, CAMERA_W, CAMERA_H, CAMERA_FPS)
 
 
 # =========================================================
@@ -92,90 +97,7 @@ running = True
 requested_device = None
 
 
-# =========================================================
-# Image preprocessing
-# =========================================================
-
-def prepare_frame(frame):
-    resized = cv2.resize(
-        frame,
-        (MODEL_W, MODEL_H)
-    )
-
-    tensor = resized.transpose(
-        2, 0, 1
-    )
-
-    tensor = tensor[
-        np.newaxis, ...
-    ]
-
-    tensor = tensor.astype(
-        np.float32
-    )
-
-    return tensor
-
-
-# =========================================================
-# Pose estimation logic moved to external modules (pose_model_runner, pose_result_processor)
-
-
-def draw_pose(frame, points):
-    # Draw skeleton
-    for part_a, part_b in POSE_PAIRS:
-        a = points.get(part_a)
-        b = points.get(part_b)
-
-        if (
-            a is not None
-            and b is not None
-        ):
-            cv2.line(
-                frame,
-                (a[0], a[1]),
-                (b[0], b[1]),
-                (0, 255, 255),
-                3
-            )
-
-    # Draw joints
-    for point in points.values():
-        if point is not None:
-            cv2.circle(
-                frame,
-                (point[0], point[1]),
-                5,
-                (0, 0, 255),
-                -1
-            )
-
-
-# =========================================================
-# Find the heatmap output
-# =========================================================
-
-def get_heatmaps(result, compiled):
-    """
-    human-pose-estimation-0001 has:
-
-        38-channel output -> PAFs
-        19-channel output -> heatmaps
-
-    Find the heatmap output by shape rather
-    than relying on output order.
-    """
-
-    for output in compiled.outputs:
-        shape = output.shape
-
-        if len(shape) == 4 and shape[1] == 19:
-            return result[output]
-
-    raise RuntimeError(
-        "Could not find the 19-channel "
-        "pose heatmap output"
-    )
+## Pose estimation and result processing are handled in external modules
 
 
 # =========================================================
@@ -205,6 +127,30 @@ def inference_loop():
             continue
 
         # Apply any pending device switch request here (single-writer pattern)
+        #
+        # STUDENT NOTE — why do we switch devices in this thread?
+        # ------------------------------------------------------
+        # Our HTTP server can handle multiple requests at once (it starts a
+        # new thread per request). The /device endpoint does NOT touch the
+        # model directly; it only sets a simple flag: `requested_device`.
+        #
+        # This inference loop is the ONLY place that actually changes the
+        # model/device. That means there is ONE WRITER (this loop) and many
+        # READERS (HTTP threads that just stream the latest JPEG). Keeping a
+        # single writer prevents "race conditions" (two threads changing the
+        # model at the same time) and avoids complicated locks.
+        #
+        # Flow:
+        #   1) A user clicks a button in the web page -> /device?name=CPU
+        #   2) The HTTP thread sets `requested_device = "CPU"` and returns
+        #   3) This loop sees `requested_device`, performs the safe switch
+        #      between frames (not in the middle of inference), and clears it
+        #
+        # This is a simple and safe pattern for beginners because:
+        #   - No model swapping while a frame is being processed
+        #   - No complicated locking is needed at the server level
+        #   - Easy to reason about: "HTTP requests only set a flag; the loop
+        #     applies the change at a good time"
         if requested_device is not None:
             to_set = requested_device
             requested_device = None
@@ -214,11 +160,18 @@ def inference_loop():
 
         tensor, frame_for_processing = None, frame
         # Use the new PoseModelRunner to execute and obtain results
+        # Ask the model runner to execute the CNN on this frame.
+        # NOTE (for students): 'res' is a small dictionary with multiple results:
+        #   - res['points']   : decoded body keypoints you can draw
+        #   - res['heatmaps'] : raw model heatmaps (useful for advanced lessons)
+        #   - res['device']   : which device ran the model (CPU / MYRIAD)
+        #   - res['frame']    : the same frame we passed in
+        #   - res['elapsed_ms']: inference time in milliseconds
         res = runner.run(frame_for_processing)
-        # Draw pose using the result processor
+
+        # Draw the skeleton using the decoded keypoints (visualization step).
         points = res["points"]
         render_pose_on_frame(frame_for_processing, points)
-        heatmaps = res["heatmaps"]
         device_name = res["device"]
         inference_ms = res["elapsed_ms"]
         # Update FPS calculations (simple approach using elapsed time)
@@ -237,45 +190,12 @@ def inference_loop():
         # Compute instantaneous inference FPS from the last inference time
         inference_fps = (1000.0 / inference_ms) if inference_ms > 0 else 0.0
 
-        # Overlay text using device_name and timings
-        cv2.putText(
+        # Overlay metrics via utility
+        annotate_metrics(
             frame_for_processing,
-            f"Device: {device_name}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame_for_processing,
-            f"Inference: {inference_ms:.0f} ms",
-            (20, 75),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame_for_processing,
-            f"Inference FPS: {inference_fps:.2f}",
-            (20, 110),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame_for_processing,
-            f"Actual loop FPS: {smoothed_loop_fps:.2f}",
-            (20, 145),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2
+            device_name,
+            inference_ms,
+            smoothed_loop_fps,
         )
 
         success, jpeg = cv2.imencode(
@@ -289,245 +209,10 @@ def inference_loop():
                 latest_jpeg = jpeg.tobytes()
 
 
-# =========================================================
-# Web page
-# =========================================================
-
-HTML = """
-<!DOCTYPE html>
-<html>
-
-<head>
-
-    <title>
-        Raspberry Pi Neural Accelerator Demo
-    </title>
-
-    <style>
-
-        body {
-            font-family: Arial, sans-serif;
-            background: #111;
-            color: white;
-            text-align: center;
-            margin: 30px;
-        }
-
-        h1 {
-            font-size: 28px;
-        }
-
-        img {
-            max-width: 90%;
-            border: 2px solid #555;
-            margin-top: 20px;
-        }
-
-        button {
-            font-size: 22px;
-            padding: 12px 30px;
-            margin: 15px;
-            cursor: pointer;
-        }
-
-        .note {
-            color: #aaa;
-            margin-top: 10px;
-        }
-
-    </style>
-
-</head>
-
-<body>
-
-    <h1>
-        Raspberry Pi 3 + Neural Accelerator
-    </h1>
-
-    <div>
-
-        <button onclick="setDevice('CPU')">
-            Raspberry Pi CPU
-        </button>
-
-        <button onclick="setDevice('MYRIAD')">
-            Intel NCS2
-        </button>
-
-    </div>
-
-    <div class="note">
-        Same CNN. Same camera.
-        Different inference hardware.
-    </div>
-
-    <img src="/video">
-
-    <script>
-
-        function setDevice(device) {
-
-            fetch(
-                '/device?name=' + device
-            )
-            .then(
-                response => response.text()
-            )
-            .then(
-                text => console.log(text)
-            );
-
-        }
-
-    </script>
-
-</body>
-
-</html>
-"""
+## HTML UI is now served from the static directory
 
 
-# =========================================================
-# HTTP server
-# =========================================================
-
-class Handler(
-    BaseHTTPRequestHandler
-):
-
-    def do_GET(self):
-        # Device selection handled via runner
-
-        parsed = urlparse(
-            self.path
-        )
-
-        # ---------------------------------------------
-        # Main page (static assets)
-        # ---------------------------------------------
-
-        if parsed.path == "/":
-            # Serve static index.html if available
-            base_dir = os.path.dirname(__file__)
-            fs_path = os.path.join(base_dir, "static", "index.html")
-            if os.path.exists(fs_path) and os.path.isfile(fs_path):
-                with open(fs_path, "rb") as f:
-                    content = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html")
-                self.end_headers()
-                self.wfile.write(content)
-                return
-            # Fallback to inline HTML if static not present
-            self.send_response(200)
-            self.send_header(
-                "Content-Type",
-                "text/html"
-            )
-            self.end_headers()
-            self.wfile.write(
-                HTML.encode("utf-8")
-            )
-
-        # ---------------------------------------------
-        # Video stream
-        # ---------------------------------------------
-
-        elif parsed.path == "/video":
-            self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                (
-                    "multipart/x-mixed-replace; "
-                    "boundary=frame"
-                )
-            )
-
-            self.end_headers()
-
-            try:
-                while running:
-                    with frame_lock:
-                        jpeg = latest_jpeg
-
-                    if jpeg is None:
-                        time.sleep(0.05)
-                        continue
-
-                    self.wfile.write(
-                        b"--frame\r\n"
-                    )
-
-                    self.wfile.write(
-                        b"Content-Type: "
-                        b"image/jpeg\r\n\r\n"
-                    )
-
-                    self.wfile.write(
-                        jpeg
-                    )
-
-                    self.wfile.write(
-                        b"\r\n"
-                    )
-
-                    time.sleep(0.03)
-
-            except (
-                BrokenPipeError,
-                ConnectionResetError
-            ):
-                pass
-
-        # ---------------------------------------------
-        # Device switching
-        # ---------------------------------------------
-
-        elif parsed.path == "/device":
-            params = parse_qs(parsed.query)
-            requested = params.get("name", [None])[0]
-            if requested not in ("CPU", "MYRIAD"):
-                self.send_response(400)
-                self.end_headers()
-                return
-
-            # Signal the inference thread to switch devices at a safe point
-            global requested_device
-            requested_device = requested
-            print(f"Device switch requested: {requested}")
-
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write((f"Switching to {requested}").encode())
-
-        # ---------------------------------------------
-        # Static assets (CSS/JS)
-        # ---------------------------------------------
-        elif parsed.path.startswith("/static/"):
-            base_dir = os.path.dirname(__file__)
-            asset_rel = parsed.path.lstrip("/")
-            asset_path = os.path.join(base_dir, asset_rel)
-            if os.path.exists(asset_path) and os.path.isfile(asset_path):
-                mime_type, _ = mimetypes.guess_type(asset_path)
-                if mime_type is None:
-                    mime_type = "application/octet-stream"
-                with open(asset_path, "rb") as f:
-                    data = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", mime_type)
-                self.end_headers()
-                self.wfile.write(data)
-                return
-            self.send_response(404)
-            self.end_headers()
-            return
-
-        else:
-            self.send_response(404)
-            self.end_headers()
+## HTTP request handling moved to server_handler.create_handler
 
 
 # =========================================================
@@ -541,36 +226,36 @@ worker = threading.Thread(
 
 worker.start()
 
-server = ThreadingHTTPServer(
-    ("0.0.0.0", WEB_PORT),
-    Handler
-)
+def get_latest_jpeg():
+    with frame_lock:
+        return latest_jpeg
 
-print()
+def request_device_callback(name: str):
+    global requested_device
+    requested_device = name
+
+def is_running():
+    return running
+
+base_dir = os.path.dirname(__file__)
+static_dir = os.path.join(base_dir, "static")
+Handler = create_handler(static_dir, get_latest_jpeg, request_device_callback, is_running)
+
+server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
+
 print(
-    "=========================================="
+    f"""
+==========================================
+Web demo running
+Port: {WEB_PORT}
+==========================================
+
+Open the Raspberry Pi's IP address
+in a browser using port {WEB_PORT}.
+
+Press Ctrl+C to stop.
+"""
 )
-print(
-    "Web demo running"
-)
-print(
-    f"Port: {WEB_PORT}"
-)
-print(
-    "=========================================="
-)
-print()
-print(
-    "Open the Raspberry Pi's IP address"
-)
-print(
-    f"in a browser using port {WEB_PORT}."
-)
-print()
-print(
-    "Press Ctrl+C to stop."
-)
-print()
 
 
 try:
