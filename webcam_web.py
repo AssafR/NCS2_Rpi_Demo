@@ -12,9 +12,18 @@ This file intentionally avoids model internals and HTML content to keep the
 lesson focused on "glue code" and system wiring.
 """
 
+# FILE MAP (for students):
+# 1) Configuration constants (model path, camera size, port)
+# 2) Webcam helper (setup_webcam)
+# 3) Shared state (latest_jpeg, requested_device)
+# 4) Callbacks used by the HTTP server (get_latest_jpeg, request_device_callback, is_running)
+# 5) Inference loop (capture → infer → visualize → compress)
+# 6) main() and the if __name__ == "__main__" guard (startup and shutdown)
+
 import time
 import threading
 from http.server import ThreadingHTTPServer
+from contextlib import contextmanager
 import os
 
 import cv2
@@ -51,12 +60,7 @@ WEB_PORT = 8080
 # Pose model loading is delegated to PoseModelRunner; no global OpenVINO setup here.
 
 
-runner = PoseModelRunner(
-    MODEL_PATH,
-    initial_device="MYRIAD",
-    model_w=MODEL_W,
-    model_h=MODEL_H,
-)
+# The model runner is created in main() so object lifetimes are easy to follow.
 
 
 # =========================================================
@@ -84,9 +88,37 @@ def setup_webcam(camera_id: int, width: int, height: int, fps: int):
 # =========================================================
 
 
+@contextmanager
+def open_webcam(camera_id: int, width: int, height: int, fps: int):
+    """Context manager wrapper for the webcam capture.
+
+    Usage:
+        with open_webcam(CAMERA_ID, CAMERA_W, CAMERA_H, CAMERA_FPS) as cap:
+            ... use cap ...
+
+    Ensures cap.release() is always called, even if an exception occurs.
+    """
+    cap = setup_webcam(camera_id, width, height, fps)
+    try:
+        yield cap
+    finally:
+        cap.release()
+
+
 # =========================================================
-# Shared frame
+# Shared frame (threading notes for students)
 # =========================================================
+# The inference loop runs in a background thread and produces JPEG bytes that
+# the HTTP server streams to browsers. We keep the "latest frame" in
+# `latest_jpeg`. Access to this shared variable is guarded by `frame_lock` so
+# the producer (inference thread) and consumers (HTTP threads) don't step on
+# each other while reading/writing it.
+#
+# Why a lock?
+# - While assigning a new Python bytes object reference is atomic, using a
+#   small lock makes intent explicit and avoids subtle races if you later
+#   extend the shared state (e.g., add timestamps or counters).
+# - It's also a good first exposure to thread coordination for beginners.
 
 latest_jpeg = None
 frame_lock = threading.Lock()
@@ -106,19 +138,21 @@ requested_device = None
 # call us back later at the right moment. Keeping these at the top level makes
 # them easier to find and read.
 
-def get_latest_jpeg():
-    """Return the most recent JPEG bytes for the /video MJPEG stream.
+def get_latest_jpeg_callback():
+    """Callback: return the most recent JPEG bytes for the /video MJPEG stream.
 
     Note:
     - May return None at startup until the first frame is processed.
     - The server writes whatever bytes it gets into the HTTP response.
+    - We use a small lock to read a consistent value while the producer may
+      be updating it in the background.
     """
     with frame_lock:
         return latest_jpeg
 
 
 def request_device_callback(name: str):
-    """Record a requested device (CPU or MYRIAD) from the HTTP handler.
+    """Callback: record a requested device (CPU or MYRIAD) from the HTTP handler.
 
     Important:
     - We do NOT switch devices here. We only set a flag.
@@ -129,8 +163,8 @@ def request_device_callback(name: str):
     requested_device = name
 
 
-def is_running():
-    """Return True while the application is active.
+def is_running_callback():
+    """Callback: return True while the application is active.
 
     The streaming loop on the server side checks this to know when to stop
     sending frames (e.g., during shutdown after Ctrl+C).
@@ -142,7 +176,7 @@ def is_running():
 # Inference thread
 # =========================================================
 
-def inference_loop(cap):
+def inference_loop(cap, runner):
     """Capture → infer → visualize → compress (JPEG) loop.
 
     Student roadmap for this loop:
@@ -266,6 +300,15 @@ def inference_loop(cap):
 # We launch the background inference loop (produces JPEGs), then build an
 # HTTP request handler by providing tiny callback functions below. This keeps
 # the web server unaware of model internals and makes the wiring explicit.
+#
+# Threading primer (students):
+# - We use ONE background thread for the model loop so the main thread can
+#   focus on serving HTTP requests without blocking on inference.
+# - The inference thread is marked daemon=True, which means it won't keep the
+#   process alive on exit; when main finishes, the daemon thread will stop.
+# - Shared state between threads is minimized: a single `latest_jpeg` buffer
+#   guarded by a small lock, and a `requested_device` flag handled by the
+#   single-writer pattern inside the inference loop.
 
 def main():
     """Program entry point: set up worker thread and HTTP server once.
@@ -275,48 +318,59 @@ def main():
       `if __name__ == "__main__":`) ensures this only runs once when you run
       the script, and not each time the module is imported elsewhere.
     """
-    # Create the webcam capture here so it clearly belongs to main()
-    cap = setup_webcam(CAMERA_ID, CAMERA_W, CAMERA_H, CAMERA_FPS)
+    # Use a context manager so the camera is always released.
+    with open_webcam(CAMERA_ID, CAMERA_W, CAMERA_H, CAMERA_FPS) as cap:
+        # Create the model runner here so lifetimes are obvious (created → used → closed)
+        runner = PoseModelRunner(
+            MODEL_PATH,
+            initial_device="MYRIAD",
+            model_w=MODEL_W,
+            model_h=MODEL_H,
+        )
 
-    worker = threading.Thread(target=inference_loop, args=(cap,), daemon=True)
-    worker.start()
+        # Start the background inference thread.
+        # daemon=True: the thread will not prevent the program from exiting.
+        worker = threading.Thread(target=inference_loop, args=(cap, runner), daemon=True)
+        worker.start()
 
-    base_dir = os.path.dirname(__file__)
-    static_dir = os.path.join(base_dir, "static")
-    Handler = create_handler(
-        static_dir,
-        get_latest_jpeg,          # how to fetch the latest JPEG bytes
-        request_device_callback,  # how to signal a requested device change
-        is_running,               # how to know when to stop streaming
-    )
+        base_dir = os.path.dirname(__file__)
+        static_dir = os.path.join(base_dir, "static")
+        Handler = create_handler(
+            static_dir,
+            get_latest_jpeg_callback,  # how to fetch the latest JPEG bytes
+            request_device_callback,    # how to signal a requested device change
+            is_running_callback,        # how to know when to stop streaming
+        )
 
-    server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
+        # Use a context manager for the HTTP server so server_close() is
+        # called automatically on exit. We still call shutdown() to stop the
+        # serve_forever() loop cleanly before leaving the with-block.
+        with ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler) as server:
+            # Output a friendly message to the console so users know where to point their browser.
+            print(
+                f"""
+                    ==========================================
+                    Web demo running
+                    Port: {WEB_PORT}
+                    ==========================================
 
-    print(
-        f"""
-==========================================
-Web demo running
-Port: {WEB_PORT}
-==========================================
+                    Open the Raspberry Pi's IP address
+                    in a browser using port {WEB_PORT}.
 
-Open the Raspberry Pi's IP address
-in a browser using port {WEB_PORT}.
+                    Press Ctrl+C to stop.
+                    """
+            )
 
-Press Ctrl+C to stop.
-"""
-    )
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopping...")
-    finally:
-        # Let the loops wind down, then close resources.
-        global running
-        running = False
-        server.shutdown()
-        cap.release()
-        print("Finished.")
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                print("\nStopping...")
+            finally:
+                # Signal the worker to stop, then shut down the server.
+                global running
+                running = False
+                server.shutdown()
+                print("Finished.")
 
 
 if __name__ == "__main__":
