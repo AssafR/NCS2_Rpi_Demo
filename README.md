@@ -69,6 +69,23 @@ python3 webcam_web.py
 - The inference loop (single writer) sees the flag and calls `runner.set_device(...)` at a safe point.
 - This avoids cross-thread model swaps while a request is streaming.
 
+## Model-only Quickstart (no web server)
+
+Run a minimal demo that opens the webcam, runs the model, and shows a window:
+
+```bash
+python3 run_model_demo.py
+```
+
+What it does:
+- Captures frames from the webcam
+- Calls `PoseModelRunner.run(frame)` to get `points`, `heatmaps`, `device`, `elapsed_ms`
+- Draws the pose and friendly overlays on the frame
+- Shows the frame in a window (press ESC to quit)
+
+If you prefer to write it yourself, see the Quickstart snippet in
+`pose_model_runner.py`.
+
 ## Glossary (for students)
 
 - Heatmaps: The model's raw, per-body-part confidence maps (19 channels in this demo). They are useful for advanced visualization and understanding what the model "sees".
@@ -87,9 +104,4 @@ python3 webcam_web.py
 - `static/` — Contains `index.html` and small JS for device switching.
 - `model/` — Pose model files (XML and BIN).
 
-## Next steps (ideas for lessons)
-
-- Visualize the heatmaps directly (false-color render per part).
-- Explain confidence thresholds and keypoint detection.
-- Compare performance across devices with a small chart.
-- Add `/status` endpoint returning JSON with device and performance metrics.
+<!-- Intentionally no lessons section for now to keep the focus on running the model. -->

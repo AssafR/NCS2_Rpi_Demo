@@ -13,6 +13,28 @@ It does NOT draw on images or serve HTTP. That separation keeps lessons clear:
 - "Model execution" (here)
 - "Result processing / visualization" (pose_result_processor.py)
 - "Web serving" (server_handler.py used by webcam_web.py)
+
+Quickstart (model-only):
+
+    from pose_model_runner import PoseModelRunner
+    from pose_result_processor import render_pose_on_frame, annotate_metrics
+    import cv2
+
+    runner = PoseModelRunner("model/human-pose-estimation-0001.xml",
+                             initial_device="CPU", model_w=456, model_h=256)
+    cap = cv2.VideoCapture(0)
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        res = runner.run(frame)
+        render_pose_on_frame(frame, res["points"])  # draw skeleton
+        annotate_metrics(frame, res["device"], res["elapsed_ms"], 0.0)
+        cv2.imshow("Pose", frame)
+        if (cv2.waitKey(1) & 0xFF) == 27:  # ESC
+            break
+    cap.release()
+    cv2.destroyAllWindows()
 """
 
 import time

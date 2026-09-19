@@ -80,10 +80,8 @@ def setup_webcam(camera_id: int, width: int, height: int, fps: int):
 
 
 # =========================================================
-# Webcam setup
+# Webcam setup happens in main() so the capture lives there
 # =========================================================
-
-cap = setup_webcam(CAMERA_ID, CAMERA_W, CAMERA_H, CAMERA_FPS)
 
 
 # =========================================================
@@ -102,10 +100,49 @@ requested_device = None
 
 
 # =========================================================
+# Callbacks for the HTTP server (top-level for readability)
+# =========================================================
+# A "callback" is a function we pass to another piece of code so that it can
+# call us back later at the right moment. Keeping these at the top level makes
+# them easier to find and read.
+
+def get_latest_jpeg():
+    """Return the most recent JPEG bytes for the /video MJPEG stream.
+
+    Note:
+    - May return None at startup until the first frame is processed.
+    - The server writes whatever bytes it gets into the HTTP response.
+    """
+    with frame_lock:
+        return latest_jpeg
+
+
+def request_device_callback(name: str):
+    """Record a requested device (CPU or MYRIAD) from the HTTP handler.
+
+    Important:
+    - We do NOT switch devices here. We only set a flag.
+    - The inference loop (single writer) will see this flag between frames
+      and call runner.set_device(name) at a safe moment.
+    """
+    global requested_device
+    requested_device = name
+
+
+def is_running():
+    """Return True while the application is active.
+
+    The streaming loop on the server side checks this to know when to stop
+    sending frames (e.g., during shutdown after Ctrl+C).
+    """
+    return running
+
+
+# =========================================================
 # Inference thread
 # =========================================================
 
-def inference_loop():
+def inference_loop(cap):
     """Capture → infer → visualize → compress (JPEG) loop.
 
     Student roadmap for this loop:
@@ -238,46 +275,11 @@ def main():
       `if __name__ == "__main__":`) ensures this only runs once when you run
       the script, and not each time the module is imported elsewhere.
     """
-    worker = threading.Thread(target=inference_loop, daemon=True)
+    # Create the webcam capture here so it clearly belongs to main()
+    cap = setup_webcam(CAMERA_ID, CAMERA_W, CAMERA_H, CAMERA_FPS)
+
+    worker = threading.Thread(target=inference_loop, args=(cap,), daemon=True)
     worker.start()
-
-    # CALLBACKS (student note)
-    # ------------------------
-    # A "callback" is a function we pass to another piece of code so that it
-    # can call us back later at the right moment. Here, we pass three small
-    # callbacks to the HTTP server factory:
-    #   - get_latest_jpeg(): how the server asks us for the newest video frame
-    #   - request_device_callback(name): how the server tells us which device
-    #       (CPU or MYRIAD) the user requested
-    #   - is_running(): how the server checks whether to keep streaming frames
-    # The server does not know our internal variables; it only knows how to
-    # call these tiny functions. This keeps responsibilities separate and the
-    # program easier to understand and test.
-
-    def get_latest_jpeg():
-        """Return the most recent JPEG bytes for the /video MJPEG stream.
-
-        Note:
-        - May return None at startup until the first frame is processed.
-        - The server writes whatever bytes it gets into the HTTP response.
-        """
-        with frame_lock:
-            return latest_jpeg
-
-    def request_device_callback(name: str):
-        """Record a requested device (CPU or MYRIAD) from the HTTP handler.
-
-        Important:
-        - We do NOT switch devices here. We only set a flag.
-        - The inference loop (single writer) will see this flag between frames
-          and call runner.set_device(name) at a safe moment.
-        """
-        global requested_device
-        requested_device = name
-
-    def is_running():
-        """Return True while the application is active."""
-        return running
 
     base_dir = os.path.dirname(__file__)
     static_dir = os.path.join(base_dir, "static")
