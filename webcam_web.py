@@ -108,23 +108,36 @@ def open_webcam(camera_id: int, width: int, height: int, fps: int):
 # =========================================================
 # Shared frame (threading notes for students)
 # =========================================================
-# The inference loop runs in a background thread and produces JPEG bytes that
-# the HTTP server streams to browsers. We keep the "latest frame" in
-# `latest_jpeg`. Access to this shared variable is guarded by `frame_lock` so
-# the producer (inference thread) and consumers (HTTP threads) don't step on
-# each other while reading/writing it.
+# The background thread makes JPEG images. The web server threads send those
+# images to the browser. Both parts share one variable: `latest_jpeg`.
 #
-# Why a lock?
-# - While assigning a new Python bytes object reference is atomic, using a
-#   small lock makes intent explicit and avoids subtle races if you later
-#   extend the shared state (e.g., add timestamps or counters).
-# - It's also a good first exposure to thread coordination for beginners.
+# What is a race?
+# - Two threads use the same data at the same time. Results can change based on
+#   timing and may look broken.
+#
+# Why use a lock?
+# - A lock is a simple gate. Only one thread can pass at a time.
+# - We take the lock, read or write `latest_jpeg`, then release the lock.
+# - This prevents mixed or half-updated data.
+# - Python usually updates a bytes variable in one step, but we still use a
+#   lock so the code stays safe if we add more shared values later.
+#
+# How to use the lock (3 steps):
+# 1) with frame_lock:
+# 2)     read or write latest_jpeg
+# 3) end of with-block → lock is released
 
 latest_jpeg = None
 frame_lock = threading.Lock()
 
 running = True
-# Device change requests are signaled by HTTP handler; applied safely in the inference thread
+# Device change requests are signaled by HTTP handler; applied safely in the
+# inference thread (single-writer pattern). We do NOT lock this flag because:
+# - Only the handler thread writes the flag, and only the inference thread
+#   reads-and-clears it between frames, so there is no concurrent write/write.
+# - Assigning a small string reference is atomic in CPython. Even so, the
+#   read-then-clear pattern guarantees we either see the request this frame or
+#   the next one.
 requested_device = None
 
 
@@ -144,8 +157,7 @@ def get_latest_jpeg_callback():
     Note:
     - May return None at startup until the first frame is processed.
     - The server writes whatever bytes it gets into the HTTP response.
-    - We use a small lock to read a consistent value while the producer may
-      be updating it in the background.
+        - We use the lock so we do not read while the background thread is writing.
     """
     with frame_lock:
         return latest_jpeg
@@ -290,6 +302,8 @@ def inference_loop(cap, runner):
         )
 
         if success:
+            # Producer writes the most recent JPEG under the lock so readers
+            # (HTTP threads) always see a consistent value.
             with frame_lock:
                 latest_jpeg = jpeg.tobytes()
 
@@ -297,8 +311,11 @@ def inference_loop(cap, runner):
 # =========================================================
 # Start
 # =========================================================
-# We launch the background inference loop (produces JPEGs), then build an
-# HTTP request handler by providing tiny callback functions below. This keeps
+# We launch the background Neural Network inference loop. The NN produces
+# activation (heat) maps; we then decode them into human-readable keypoints,
+# draw the skeleton/metrics on the frame, and finally compress the frame to
+# a JPEG for streaming. After that, we build an HTTP handler that streams the
+# latest JPEGs using the tiny callback functions below. This keeps
 # the web server unaware of model internals and makes the wiring explicit.
 #
 # Threading primer (students):
