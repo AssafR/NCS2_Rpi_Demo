@@ -16,7 +16,7 @@ lesson focused on "glue code" and system wiring.
 # 1) Configuration constants (model path, camera size, port)
 # 2) Webcam helper (setup_webcam)
 # 3) Shared state (latest_jpeg, requested_device)
-# 4) Callbacks used by the HTTP server (get_latest_jpeg, request_device_callback, is_running)
+# 4) Callbacks used by the HTTP server (get_latest_jpeg_callback, request_device_callback, is_running_callback)
 # 5) Inference loop (capture → infer → visualize → compress)
 # 6) main() and the if __name__ == "__main__" guard (startup and shutdown)
 
@@ -24,6 +24,7 @@ import time
 import threading
 from http.server import ThreadingHTTPServer
 from contextlib import contextmanager
+from typing import Optional, Generator, Final
 import os
 
 import cv2
@@ -43,18 +44,18 @@ from server_handler import create_handler
 # Configuration
 # =========================================================
 
-MODEL_PATH = "model/human-pose-estimation-0001.xml"
+MODEL_PATH: Final[str] = "model/human-pose-estimation-0001.xml"
 
-CAMERA_ID = 0
+CAMERA_ID: Final[int] = 0
 
-MODEL_W = 456
-MODEL_H = 256
+MODEL_W: Final[int] = 456
+MODEL_H: Final[int] = 256
 
-CAMERA_W = 640
-CAMERA_H = 480
-CAMERA_FPS = 15
+CAMERA_W: Final[int] = 640
+CAMERA_H: Final[int] = 480
+CAMERA_FPS: Final[int] = 15
 
-WEB_PORT = 8080
+WEB_PORT: Final[int] = 8080
 
 
 # Pose model loading is delegated to PoseModelRunner; no global OpenVINO setup here.
@@ -67,7 +68,7 @@ WEB_PORT = 8080
 # Webcam setup helper
 # =========================================================
 
-def setup_webcam(camera_id: int, width: int, height: int, fps: int):
+def setup_webcam(camera_id: int, width: int, height: int, fps: int) -> cv2.VideoCapture:
     """Create and configure a VideoCapture for the given camera.
 
     For students: this is separate from the inference loop so you can clearly
@@ -89,7 +90,7 @@ def setup_webcam(camera_id: int, width: int, height: int, fps: int):
 
 
 @contextmanager
-def open_webcam(camera_id: int, width: int, height: int, fps: int):
+def open_webcam(camera_id: int, width: int, height: int, fps: int) -> Generator[cv2.VideoCapture, None, None]:
     """Context manager wrapper for the webcam capture.
 
     Usage:
@@ -127,10 +128,9 @@ def open_webcam(camera_id: int, width: int, height: int, fps: int):
 # 2)     read or write latest_jpeg
 # 3) end of with-block → lock is released
 
-latest_jpeg = None
-frame_lock = threading.Lock()
+latest_jpeg: Optional[bytes] = None # Holds image bytes for the MJPEG stream. Updated by inference thread, read by HTTP threads.
+frame_lock: threading.Lock = threading.Lock()
 
-running = True
 # Device change requests are signaled by HTTP handler; applied safely in the
 # inference thread (single-writer pattern). We do NOT lock this flag because:
 # - Only the handler thread writes the flag, and only the inference thread
@@ -138,8 +138,9 @@ running = True
 # - Assigning a small string reference is atomic in CPython. Even so, the
 #   read-then-clear pattern guarantees we either see the request this frame or
 #   the next one.
-requested_device = None
+requested_device: Optional[str] = None
 
+running: bool = True
 
 ## Pose estimation and result processing are handled in external modules
 
@@ -151,31 +152,32 @@ requested_device = None
 # call us back later at the right moment. Keeping these at the top level makes
 # them easier to find and read.
 
-def get_latest_jpeg_callback():
-    """Callback: return the most recent JPEG bytes for the /video MJPEG stream.
+def get_latest_jpeg_callback() -> Optional[bytes]:
+    """Callback: return the most recent JPEG bytes for the /video stream.
 
     Note:
     - May return None at startup until the first frame is processed.
     - The server writes whatever bytes it gets into the HTTP response.
+    - The /video endpoint serves MJPEG (a stream of JPEG images).
         - We use the lock so we do not read while the background thread is writing.
     """
     with frame_lock:
         return latest_jpeg
 
 
-def request_device_callback(name: str):
+def request_device_callback(name: str) -> None:
     """Callback: record a requested device (CPU or MYRIAD) from the HTTP handler.
 
     Important:
     - We do NOT switch devices here. We only set a flag.
     - The inference loop (single writer) will see this flag between frames
-      and call runner.set_device(name) at a safe moment.
+        and call set_device(name) on the model runner at a safe moment.
     """
-    global requested_device
+    global requested_device  # Optional[str]
     requested_device = name
 
 
-def is_running_callback():
+def is_running_callback() -> bool:
     """Callback: return True while the application is active.
 
     The streaming loop on the server side checks this to know when to stop
@@ -188,7 +190,7 @@ def is_running_callback():
 # Inference thread
 # =========================================================
 
-def inference_loop(cap, runner):
+def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None:
     """Capture → infer → visualize → compress (JPEG) loop.
 
     Student roadmap for this loop:
@@ -196,16 +198,15 @@ def inference_loop(cap, runner):
     2) Check if a device switch was requested and apply it here (single writer)
     3) Ask the model runner to run inference and return results
     4) Draw the pose and friendly overlays using visualization helpers
-     5) Compress the frame to JPEG (image compression, not a neural network)
-         and publish it for the HTTP streamer
+    5) Compress the frame to JPEG (image compression, not a neural network)
+       and send it to the HTTP streamer
     """
-    global latest_jpeg
-    global requested_device
+    global latest_jpeg  # Optional[bytes]
+    global requested_device  # Optional[str]
 
-    smoothed_inference_ms = None
-    smoothed_loop_fps = None
+    smoothed_loop_fps: Optional[float] = None
 
-    last_frame_time = (
+    last_frame_time: float = (
         time.perf_counter()
     )
 
@@ -249,10 +250,10 @@ def inference_loop(cap, runner):
             to_set = requested_device
             requested_device = None
             print(f"\nApplying device switch to: {to_set}...")
-            ok = runner.set_device(to_set)
+            ok = model_runner.set_device(to_set)
             print("Switch successful." if ok else "Switch failed.")
 
-        tensor, frame_for_processing = None, frame
+        frame_for_processing = frame
         # Use the new PoseModelRunner to execute and obtain results
         # Ask the model runner to execute the CNN on this frame.
         # NOTE (for students): 'res' is a small dictionary with multiple results:
@@ -261,7 +262,7 @@ def inference_loop(cap, runner):
         #   - res['device']   : which device ran the model (CPU / MYRIAD)
         #   - res['frame']    : the same frame we passed in
         #   - res['elapsed_ms']: inference time in milliseconds
-        res = runner.run(frame_for_processing)
+        res = model_runner.run(frame_for_processing)
 
         device_name = res["device"]
         inference_ms = res["elapsed_ms"]
@@ -283,10 +284,7 @@ def inference_loop(cap, runner):
                 + 0.1 * instant_loop_fps
             )
 
-        # Compute instantaneous inference FPS from the last inference time
-        inference_fps = (1000.0 / inference_ms) if inference_ms > 0 else 0.0
-
-        # Overlay metrics via utility
+        # Overlay metrics text on the picture, via utility
         annotate_metrics(
             frame_for_processing,
             device_name,
@@ -314,8 +312,9 @@ def inference_loop(cap, runner):
 # We launch the background Neural Network inference loop. The NN produces
 # activation (heat) maps; we then decode them into human-readable keypoints,
 # draw the skeleton/metrics on the frame, and finally compress the frame to
-# a JPEG for streaming. After that, we build an HTTP handler that streams the
-# latest JPEGs using the tiny callback functions below. This keeps
+# a JPEG for streaming (MJPEG = a stream of JPEG images). After that, we build
+# an HTTP handler that streams the latest JPEGs using the tiny callback
+# functions below. This keeps
 # the web server unaware of model internals and makes the wiring explicit.
 #
 # Threading primer (students):
@@ -327,7 +326,7 @@ def inference_loop(cap, runner):
 #   guarded by a small lock, and a `requested_device` flag handled by the
 #   single-writer pattern inside the inference loop.
 
-def main():
+def main() -> None:
     """Program entry point: set up worker thread and HTTP server once.
 
     Student note:
@@ -338,7 +337,7 @@ def main():
     # Use a context manager so the camera is always released.
     with open_webcam(CAMERA_ID, CAMERA_W, CAMERA_H, CAMERA_FPS) as cap:
         # Create the model runner here so lifetimes are obvious (created → used → closed)
-        runner = PoseModelRunner(
+        model_runner: PoseModelRunner = PoseModelRunner(
             MODEL_PATH,
             initial_device="MYRIAD",
             model_w=MODEL_W,
@@ -347,8 +346,10 @@ def main():
 
         # Start the background inference thread.
         # daemon=True: the thread will not prevent the program from exiting.
-        worker = threading.Thread(target=inference_loop, args=(cap, runner), daemon=True)
-        worker.start()
+        inference_thread: threading.Thread = threading.Thread(
+            target=inference_loop, args=(cap, model_runner), daemon=True
+        )
+        inference_thread.start()
 
         base_dir = os.path.dirname(__file__)
         static_dir = os.path.join(base_dir, "static")
@@ -384,7 +385,7 @@ def main():
                 print("\nStopping...")
             finally:
                 # Signal the worker to stop, then shut down the server.
-                global running
+                global running  # bool
                 running = False
                 server.shutdown()
                 print("Finished.")

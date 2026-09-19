@@ -8,7 +8,7 @@ from the model code and the drawing code.
 Routes we serve:
 - "/"            → main static HTML page (from static_dir)
 - "/static/..."  → CSS/JS/assets (from static_dir)
-- "/video"       → MJPEG stream of JPEG images (latest frame)
+- "/video"       → MJPEG (a stream of JPEG images) with the latest frame
 - "/device"      → ask the app to switch device (CPU or MYRIAD)
 
 This separation makes it easier to learn: web server vs model vs drawing.

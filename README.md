@@ -60,7 +60,7 @@ python3 webcam_web.py
 
 - `/` — Serves the static UI (index.html)
 - `/static/...` — Serves JS/CSS/assets from the static folder
-- `/video` — MJPEG video stream (the `<img src="/video">` in the page uses this)
+- `/video` — MJPEG video stream (a stream of JPEG images). The `<img src="/video">` in the page uses this.
 - `/device?name=CPU|MYRIAD` — Signals a device switch; the inference loop applies it safely
 
 ## How device switching works (simple & safe)
