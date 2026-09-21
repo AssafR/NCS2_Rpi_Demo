@@ -14,17 +14,16 @@ lesson focused on "glue code" and system wiring.
 
 # FILE MAP (for students):
 # 1) Configuration constants (model path, camera size, port)
-# 2) Webcam helper (setup_webcam)
+# 2) Camera process (keeps the newest captured frame)
 # 3) Shared state (latest_jpeg, requested_device, requested_heatmaps)
 # 4) Callbacks used by the HTTP server (get_latest_jpeg_callback, request_device_callback, request_heatmaps_callback, is_running_callback)
-# 5) Inference loop (capture → infer → visualize → compress)
+# 5) Inference loop (reads newest captured frame, runs the model, draws overlays)
 # 6) main() and the if __name__ == "__main__" guard (startup and shutdown)
 
 import time
 import threading
 from http.server import ThreadingHTTPServer
-from contextlib import contextmanager
-from typing import Optional, Generator, Final
+from typing import Optional, Final
 import os
 
 import cv2
@@ -36,10 +35,12 @@ from pose_model_runner import PoseModelRunner
 from pose_result_processor import (
     render_pose_on_frame,
     annotate_metrics,
+    put_text_with_outline,
     heatmap_to_image,
     heatmaps_grid_to_image,
 )
 from pose_defs import BODY_PARTS
+from camera_capture import ProcessCameraFrameGrabber
 from server_handler import create_handler
 
 
@@ -59,63 +60,18 @@ MODEL_H: Final[int] = 256
 
 CAMERA_W: Final[int] = 640
 CAMERA_H: Final[int] = 480
-CAMERA_FPS: Final[int] = 15
+CAMERA_FPS: Final[int] = 5 # 15
 
 WEB_PORT: Final[int] = 8080
 
-
-# Pose model loading is delegated to PoseModelRunner; no global OpenVINO setup here.
-
-
-# The model runner is created in main() so object lifetimes are easy to follow.
+# Print one short timing report every few seconds for troubleshooting.
+DIAGNOSTIC_REPORT_SECONDS: Final[float] = 5.0
 
 
 # =========================================================
-# Webcam setup helper
+# Shared frame and sampling gate (threading notes for students)
 # =========================================================
-
-def setup_webcam(camera_id: int, width: int, height: int, fps: int) -> cv2.VideoCapture:
-    """Create and configure a VideoCapture for the given camera.
-
-    For students: this is separate from the inference loop so you can clearly
-    see the camera configuration in one place.
-    """
-    cap = cv2.VideoCapture(camera_id, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS, fps)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open webcam")
-    print("Webcam opened successfully.")
-    return cap
-
-
-# =========================================================
-# Webcam setup happens in main() so the capture lives there
-# =========================================================
-
-
-@contextmanager
-def open_webcam(camera_id: int, width: int, height: int, fps: int) -> Generator[cv2.VideoCapture, None, None]:
-    """Context manager wrapper for the webcam capture.
-
-    Usage:
-        with open_webcam(CAMERA_ID, CAMERA_W, CAMERA_H, CAMERA_FPS) as cap:
-            ... use cap ...
-
-    Ensures cap.release() is always called, even if an exception occurs.
-    """
-    cap = setup_webcam(camera_id, width, height, fps)
-    try:
-        yield cap
-    finally:
-        cap.release()
-
-
-# =========================================================
-# Shared frame (threading notes for students)
-# =========================================================
-# The background thread makes JPEG images. The web server threads send those
+# The inference thread makes JPEG images. The web server threads send those
 # images to the browser. Both parts share one variable: `latest_jpeg`.
 #
 # What is a race?
@@ -129,10 +85,13 @@ def open_webcam(camera_id: int, width: int, height: int, fps: int) -> Generator[
 # - Python usually updates a bytes variable in one step, but we still use a
 #   lock so the code stays safe if we add more shared values later.
 #
-# How to use the lock (3 steps):
-# 1) with frame_lock:
-# 2)     read or write latest_jpeg
-# 3) end of with-block → lock is released
+# A separate camera process captures frames. The model loop processes the
+# newest received frame and stores a JPEG.
+# The browser stream simply shows the latest JPEG when it can.
+#
+# How to use the shared state:
+# 1) frame_lock: protects the shared latest_jpeg bytes
+# 2) read newest frame -> process -> publish JPEG -> continue
 
 latest_jpeg: Optional[bytes] = None # Holds image bytes for the MJPEG stream. Updated by inference thread, read by HTTP threads.
 frame_lock: threading.Lock = threading.Lock()
@@ -163,7 +122,7 @@ running: bool = True
 # them easier to find and read.
 
 def get_latest_jpeg_callback() -> Optional[bytes]:
-    """Callback: return the most recent JPEG bytes for the /video stream.
+    """Callback: return the most recent JPEG bytes for /video.
 
     Note:
     - May return None at startup until the first frame is processed.
@@ -206,40 +165,49 @@ def is_running_callback() -> bool:
 # Inference thread
 # =========================================================
 
-def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None:
-    """Capture → infer → visualize → compress (JPEG) loop.
+def inference_loop(capture_grabber: ProcessCameraFrameGrabber, model_runner: PoseModelRunner) -> None:
+    """Infer → visualize → compress (JPEG) loop.
 
     Student roadmap for this loop:
-    1) Read a frame from the webcam
-    2) Check if a device switch was requested and apply it here (single writer)
-    3) Ask the model runner to run inference and return results
-    4) Draw the pose and friendly overlays using visualization helpers
-    5) Compress the frame to JPEG (image compression, not a neural network)
+    1) Wait until the capture helper has at least one frame
+    2) Copy the newest camera frame
+    3) Check if a device switch was requested and apply it here (single writer)
+    4) Ask the model runner to run inference and return results
+    5) Draw the pose and friendly overlays using visualization helpers
+    6) Compress the frame to JPEG (image compression, not a neural network)
        and send it to the HTTP streamer
     """
     global latest_jpeg  # Optional[bytes]
     global requested_device  # Optional[str]
     global requested_heatmaps  # Optional[bool]
 
-    smoothed_loop_fps: Optional[float] = None
     show_heatmaps: bool = False  # Start hidden. The user can show them from the web page.
-
-    last_frame_time: float = (
-        time.perf_counter()
-    )
+    device_switch_message: Optional[str] = None
+    last_diagnostic_report_time = time.perf_counter()
+    last_processed_frame_number = 0
 
     while running:
-        ret, frame = cap.read()
-
-        if not ret:
-            print(
-                "Failed to capture webcam frame"
-            )
-
-            time.sleep(0.1)
+        # BUG FIX: Wait for a genuinely new camera frame.
+        #
+        # It is not enough to ask "Do we have a frame?" The answer stays yes
+        # after the first frame. If the camera later becomes slow or times out,
+        # that old frame would still exist and the model could process it again.
+        #
+        # Instead, we remember the number of the last frame we processed and
+        # wait for the camera helper to give us a higher number. This means
+        # one successful camera capture can be processed only once.
+        if not capture_grabber.wait_for_new_frame(last_processed_frame_number, 0.1):
             continue
 
-        # Apply any pending device switch request here (single-writer pattern)
+        # Copy the newest sampled frame so the capture thread can keep running.
+        frame_for_processing, frame_capture_time, frame_number = capture_grabber.get_latest_frame()
+        if frame_for_processing is None:
+            continue
+        # Remember this number before inference starts. The next loop must wait
+        # for a newer frame number, even if the camera has a temporary timeout.
+        last_processed_frame_number = frame_number
+
+        # Apply any pending device switch request here.
         #
         # STUDENT NOTE — why do we switch devices in this thread?
         # ------------------------------------------------------
@@ -247,11 +215,8 @@ def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None
         # new thread per request). The /device endpoint does NOT touch the
         # model directly; it only sets a simple flag: `requested_device`.
         #
-        # This inference loop is the ONLY place that actually changes the
-        # model/device. That means there is ONE WRITER (this loop) and many
-        # READERS (HTTP threads that just stream the latest JPEG). Keeping a
-        # single writer prevents "race conditions" (two threads changing the
-        # model at the same time) and avoids complicated locks.
+        # This inference loop is the only place that changes the model.
+        # The HTTP threads only set a request flag.
         #
         # Flow:
         #   1) A user clicks a button in the web page -> /device?name=CPU
@@ -264,11 +229,15 @@ def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None
         #   - No complicated locking is needed at the server level
         #   - Easy to reason about: "HTTP requests only set a flag; the loop
         #     applies the change at a good time"
+        device_switch_ms = 0.0
         if requested_device is not None:
             to_set = requested_device
             requested_device = None
             print(f"\nApplying device switch to: {to_set}...")
+            device_switch_start_time = time.perf_counter()
             ok = model_runner.set_device(to_set)
+            device_switch_ms = (time.perf_counter() - device_switch_start_time) * 1000.0
+            device_switch_message = f"Timing reset after switching to {to_set}"
             print("Switch successful." if ok else "Switch failed.")
 
         # Apply a requested heatmap show/hide change between frames.
@@ -276,8 +245,7 @@ def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None
             show_heatmaps = requested_heatmaps
             requested_heatmaps = None
 
-        frame_for_processing = frame
-        # Use the new PoseModelRunner to execute and obtain results
+        # Use the new PoseModelRunner to execute and obtain results.
         # Ask the model runner to execute the CNN on this frame.
         # NOTE (for students): 'res' is a small dictionary with multiple results:
         #   - res['points']   : decoded body keypoints you can draw
@@ -285,7 +253,11 @@ def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None
         #   - res['device']   : which device ran the model (CPU / MYRIAD)
         #   - res['frame']    : the same frame we passed in
         #   - res['elapsed_ms']: inference time in milliseconds
+        model_call_start_time = time.perf_counter()
+        frame_wait_before_model_ms = (model_call_start_time - frame_capture_time) * 1000.0
         res = model_runner.run_inference(frame_for_processing)
+        inference_finished_time = time.perf_counter()
+        full_model_call_ms = (inference_finished_time - model_call_start_time) * 1000.0
 
         device_name = res["device"]
         inference_ms = res["elapsed_ms"]
@@ -293,6 +265,9 @@ def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None
         # Draw the skeleton using the decoded keypoints (visualization step).
         points = res["points"]
         render_pose_on_frame(frame_for_processing, points)
+
+        # How long this frame waited before it was ready to show.
+        display_latency_ms = (time.perf_counter() - frame_capture_time) * 1000.0
 
         # The heatmap grid is optional. It starts hidden so the first view is
         # the simple camera image and stick figure.
@@ -307,44 +282,84 @@ def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None
                 cols=5,
             )
 
-        # Update FPS calculations (simple approach using elapsed time)
-        now = time.perf_counter()
-        loop_time = now - last_frame_time
-        last_frame_time = now
-        instant_loop_fps = 1.0 / loop_time if loop_time > 0 else 0.0
-        if smoothed_loop_fps is None:
-            smoothed_loop_fps = instant_loop_fps
-        else:
-            smoothed_loop_fps = (
-                0.9 * smoothed_loop_fps
-                + 0.1 * instant_loop_fps
-            )
-
         # Overlay metrics text on the picture, via utility
         annotate_metrics(
             frame_for_processing,
             device_name,
             inference_ms,
-            smoothed_loop_fps,
+            display_latency_ms,
         )
+
+        # Show a short note on the first frame after a device switch.
+        # This helps students see that the timing restarted.
+        if device_switch_message is not None:
+            put_text_with_outline(
+                frame_for_processing,
+                device_switch_message,
+                (20, 180),
+                0.6,
+                (0, 255, 255),
+                2,
+            )
+            device_switch_message = None
 
         # If enabled, put the heatmap grid to the right of the camera image.
         output_image = frame_for_processing
         if show_heatmaps:
             output_image = cv2.hconcat([frame_for_processing, heat_img])
 
-        # Compress the output image to JPEG for streaming over HTTP
+        # Compress the output image to JPEG for streaming over HTTP.
+        # This timing includes drawing overlays and optional heatmaps.
+        post_processing_ms = (time.perf_counter() - inference_finished_time) * 1000.0
+        jpeg_start_time = time.perf_counter()
         success, jpeg = cv2.imencode(
             ".jpg",
             output_image,
-            [cv2.IMWRITE_JPEG_QUALITY, 80]
+            [cv2.IMWRITE_JPEG_QUALITY, 90]  # 0-100, higher = better quality
         )
+        jpeg_encoding_ms = (time.perf_counter() - jpeg_start_time) * 1000.0
+        ready_to_send_delay_ms = (time.perf_counter() - frame_capture_time) * 1000.0
 
         if success:
             # Producer writes the most recent JPEG under the lock so readers
             # (HTTP threads) always see a consistent value.
             with frame_lock:
                 latest_jpeg = jpeg.tobytes()
+
+        # Print a short report periodically instead of printing once per frame.
+        # This lets us compare camera work, model work, and the rest of the path.
+        now = time.perf_counter()
+        if now - last_diagnostic_report_time >= DIAGNOSTIC_REPORT_SECONDS:
+            (
+                capture_fps,
+                average_read_ms,
+                average_read_cpu_ms,
+                maximum_read_ms,
+                failed_reads,
+                replaced_frames,
+            ) = (
+                capture_grabber.take_diagnostics()
+            )
+            newer_frames = capture_grabber.get_latest_frame_number() - frame_number
+            load_average = os.getloadavg()[0] if hasattr(os, "getloadavg") else 0.0
+
+            print(
+                "\n--- Pipeline diagnostic ---\n"
+                f"Device: {device_name}\n"
+                f"Camera: {capture_fps:.1f} frames/s, read average {average_read_ms:.1f} ms, "
+                f"read CPU {average_read_cpu_ms:.1f} ms, read maximum {maximum_read_ms:.1f} ms, "
+                f"failed reads {failed_reads}\n"
+                f"Frame wait before model: {frame_wait_before_model_ms:.1f} ms\n"
+                f"Model call: {full_model_call_ms:.1f} ms, network only: {inference_ms:.1f} ms\n"
+                f"Device switch in this frame: {device_switch_ms:.1f} ms\n"
+                f"After model: {post_processing_ms:.1f} ms, JPEG: {jpeg_encoding_ms:.1f} ms\n"
+                f"Ready to send delay: {ready_to_send_delay_ms:.1f} ms\n"
+                f"Newer frames captured during this model pass: {newer_frames}\n"
+                f"Older frames replaced in the last report: {replaced_frames}\n"
+                f"System load average (1 minute): {load_average:.2f}\n"
+                "---------------------------"
+            )
+            last_diagnostic_report_time = now
 
 
 # =========================================================
@@ -358,14 +373,15 @@ def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None
 # functions below. This keeps
 # the web server unaware of model internals and makes the wiring explicit.
 #
-# Threading primer (students):
-# - We use ONE background thread for the model loop so the main thread can
-#   focus on serving HTTP requests without blocking on inference.
-# - The inference thread is marked daemon=True, which means it won't keep the
-#   process alive on exit; when main finishes, the daemon thread will stop.
-# - Shared state between threads is minimized: a single `latest_jpeg` buffer
-#   guarded by a small lock, and a `requested_device` flag handled by the
-#   single-writer pattern inside the inference loop.
+# Concurrency primer (students):
+# - The camera uses a separate process. This keeps slow CPU inference from
+#   slowing down V4L2 camera reads in the main process.
+# - The inference loop uses one daemon thread, so the main thread can serve
+#   HTTP requests without waiting for inference to finish.
+# - The camera process sends only its newest frame. Old queued frames are
+#   replaced instead of forming a long queue.
+# - Shared data in this process is minimized: one `latest_jpeg` buffer guarded
+#   by a lock, plus simple device and heatmap request flags.
 
 def main() -> None:
     """Program entry point: set up worker thread and HTTP server once.
@@ -375,62 +391,70 @@ def main() -> None:
       `if __name__ == "__main__":`) ensures this only runs once when you run
       the script, and not each time the module is imported elsewhere.
     """
-    # Use a context manager so the camera is always released.
-    with open_webcam(CAMERA_ID, CAMERA_W, CAMERA_H, CAMERA_FPS) as cap:
-        # Create the model runner here so lifetimes are obvious (created → used → closed)
-        model_runner: PoseModelRunner = PoseModelRunner(
-            MODEL_PATH,
-            initial_device="MYRIAD",
-            model_w=MODEL_W,
-            model_h=MODEL_H,
+    # Create the model runner here so lifetimes are obvious (created -> used -> closed).
+    model_runner: PoseModelRunner = PoseModelRunner(
+        MODEL_PATH,
+        initial_device="MYRIAD",
+        model_w=MODEL_W,
+        model_h=MODEL_H,
+    )
+
+    # The camera gets its own process. This keeps V4L2 camera reads separate
+    # from slow CPU inference in this main process.
+    capture_grabber = ProcessCameraFrameGrabber(
+        CAMERA_ID,
+        CAMERA_W,
+        CAMERA_H,
+        CAMERA_FPS,
+    )
+    capture_grabber.start()
+
+    # Start the background inference thread in the main process.
+    inference_thread: threading.Thread = threading.Thread(
+        target=inference_loop, args=(capture_grabber, model_runner), daemon=True
+    )
+    inference_thread.start()
+
+    base_dir = os.path.dirname(__file__)
+    static_dir = os.path.join(base_dir, "static")
+    Handler = create_handler(
+        static_dir,
+        get_latest_jpeg_callback,   # how to fetch the latest JPEG bytes
+        request_device_callback,    # how to signal a requested device change
+        request_heatmaps_callback,  # how to show or hide the heatmap grid
+        is_running_callback,        # how to know when to stop streaming
+    )
+
+    # Use a context manager for the HTTP server so server_close() is
+    # called automatically on exit. We still call shutdown() to stop the
+    # serve_forever() loop cleanly before leaving the with-block.
+    with ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler) as server:
+        # Output a friendly message to the console so users know where to point their browser.
+        print(
+            f"""
+                ==========================================
+                Web demo running
+                Port: {WEB_PORT}
+                ==========================================
+
+                Open the Raspberry Pi's IP address
+                in a browser using port {WEB_PORT}.
+
+                Press Ctrl+C to stop.
+                """
         )
 
-        # Start the background inference thread.
-        # daemon=True: the thread will not prevent the program from exiting.
-        inference_thread: threading.Thread = threading.Thread(
-            target=inference_loop, args=(cap, model_runner), daemon=True
-        )
-        inference_thread.start()
-
-        base_dir = os.path.dirname(__file__)
-        static_dir = os.path.join(base_dir, "static")
-        Handler = create_handler(
-            static_dir,
-            get_latest_jpeg_callback,  # how to fetch the latest JPEG bytes
-            request_device_callback,    # how to signal a requested device change
-            request_heatmaps_callback,  # how to show or hide the heatmap grid
-            is_running_callback,        # how to know when to stop streaming
-        )
-
-        # Use a context manager for the HTTP server so server_close() is
-        # called automatically on exit. We still call shutdown() to stop the
-        # serve_forever() loop cleanly before leaving the with-block.
-        with ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler) as server:
-            # Output a friendly message to the console so users know where to point their browser.
-            print(
-                f"""
-                    ==========================================
-                    Web demo running
-                    Port: {WEB_PORT}
-                    ==========================================
-
-                    Open the Raspberry Pi's IP address
-                    in a browser using port {WEB_PORT}.
-
-                    Press Ctrl+C to stop.
-                    """
-            )
-
-            try:
-                server.serve_forever()
-            except KeyboardInterrupt:
-                print("\nStopping...")
-            finally:
-                # Signal the worker to stop, then shut down the server.
-                global running  # bool
-                running = False
-                server.shutdown()
-                print("Finished.")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nStopping...")
+        finally:
+            # Signal workers to stop, then shut down the server.
+            global running  # bool
+            running = False
+            capture_grabber.stop()
+            server.shutdown()
+            print("Finished.")
 
 
 if __name__ == "__main__":

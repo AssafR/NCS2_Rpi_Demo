@@ -151,7 +151,7 @@ def put_text_with_outline(
     position,
     font_scale,
     color,
-    thickness=2,
+    thickness=1.5,
     outline_color=(0, 0, 0),
     outline_thickness=2
 ):
@@ -202,8 +202,13 @@ def put_text_with_outline(
     return frame
 
 
-def annotate_metrics(frame, device: str, inference_ms: float, loop_fps: float):
-    """Draw text: device name, inference time (ms), and FPS.
+def annotate_metrics(frame, device: str, model_time_ms: float, display_delay_ms: float):
+    """Draw the main pipeline timings for students.
+
+    The overlay shows three simple ideas:
+    - which device ran the model
+    - how long the model took
+    - how long the frame waited before the browser saw it
 
     Note: These numbers are just text drawn on the image. They are not part
     of the model output.
@@ -217,30 +222,20 @@ def annotate_metrics(frame, device: str, inference_ms: float, loop_fps: float):
         (0, 255, 0),
         2
     )
-    # Inference time with outline
+    # How long the model needed to process the frame
     put_text_with_outline(
         frame,
-        f"Inference: {inference_ms:.0f} ms",
+        f"Model time: {model_time_ms:.0f} ms",
         (20, 75),
         0.7,
         (0, 255, 0),
         2
     )
-    # Inference FPS (derived) with outline
-    inf_fps = (1000.0 / inference_ms) if inference_ms and inference_ms > 0 else 0.0
+    # How long the frame waited before the browser saw it
     put_text_with_outline(
         frame,
-        f"Inference FPS: {inf_fps:.2f}",
+        f"Display delay: {display_delay_ms:.0f} ms",
         (20, 110),
-        0.7,
-        (0, 255, 0),
-        2
-    )
-    # Actual loop FPS (smoothed) with outline
-    put_text_with_outline(
-        frame,
-        f"Actual loop FPS: {loop_fps:.2f}",
-        (20, 145),
         0.7,
         (0, 255, 0),
         2

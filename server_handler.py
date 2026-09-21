@@ -31,7 +31,7 @@ def create_handler(static_dir: str,
 
     Args:
         static_dir: where index.html and /static files live
-        get_latest_jpeg: () -> Optional[bytes], returns most recent JPEG frame
+        get_latest_jpeg: () -> Optional[bytes], returns the most recent JPEG frame
         request_device_callback: (str) -> None, called with 'CPU' or 'MYRIAD'
         request_heatmaps_callback: (bool) -> None, show or hide the heatmap grid
         is_running: () -> bool, tells the streaming loop when to stop
@@ -88,16 +88,23 @@ def create_handler(static_dir: str,
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                 self.end_headers()
                 try:
-                    # Continuously write JPEG frames in a multipart response
+                    # Continuously write the latest JPEG that the model loop has finished.
+                    # If the browser is slower than the model, it will simply show
+                    # the newest completed frame it has received.
+                    last_sent_jpeg = None
                     while is_running():
                         jpeg = get_latest_jpeg()
                         if jpeg is None:
                             time.sleep(0.05)
                             continue
+                        if jpeg == last_sent_jpeg:
+                            time.sleep(0.03)
+                            continue
                         self.wfile.write(b"--frame\r\n")
                         self.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
                         self.wfile.write(jpeg)
                         self.wfile.write(b"\r\n")
+                        last_sent_jpeg = jpeg
                         time.sleep(0.03)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
