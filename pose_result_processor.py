@@ -60,7 +60,6 @@ def overlay_mask(frame, mask):
         return cv2.addWeighted(frame, 0.8, colored, 0.2, 0)
     return frame
 
-
 def heatmap_to_image(heatmap: np.ndarray, out_size: Tuple[int, int]) -> np.ndarray:
     """Convert one heatmap channel into a color image for display.
 
@@ -85,7 +84,6 @@ def heatmap_to_image(heatmap: np.ndarray, out_size: Tuple[int, int]) -> np.ndarr
     # Apply color map for easier viewing
     heat_color = cv2.applyColorMap(hm_resized, cv2.COLORMAP_JET)
     return heat_color
-
 
 def heatmaps_grid_to_image(
     heatmaps_3d: np.ndarray,
@@ -147,49 +145,102 @@ def heatmaps_grid_to_image(
 
     return grid
 
+def put_text_with_outline(
+    frame,
+    text,
+    position,
+    font_scale,
+    color,
+    thickness=2,
+    outline_color=(0, 0, 0),
+    outline_thickness=2
+):
+    """
+    Draw text with an outline for improved readability and
+    resistance to video compression.
+
+    Args:
+        frame: BGR image to draw on.
+        text: Text to draw.
+        position: (x, y) coordinates of the text baseline.
+        font_scale: OpenCV font scale.
+        color: BGR color of the main text.
+        thickness: Thickness of the main text.
+        outline_color: BGR color of the outline.
+        outline_thickness: Additional thickness around the text.
+
+    Returns:
+        The modified frame.
+    """
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    # Draw the outline first
+    cv2.putText(
+        frame,
+        text,
+        position,
+        font,
+        font_scale,
+        outline_color,
+        thickness + outline_thickness,
+        cv2.LINE_AA
+    )
+
+    # Draw the main text over the outline
+    cv2.putText(
+        frame,
+        text,
+        position,
+        font,
+        font_scale,
+        color,
+        thickness,
+        cv2.LINE_AA
+    )
+
+    return frame
+
+
 def annotate_metrics(frame, device: str, inference_ms: float, loop_fps: float):
     """Draw text: device name, inference time (ms), and FPS.
 
     Note: These numbers are just text drawn on the image. They are not part
     of the model output.
     """
-    # Device name
-    cv2.putText(
+    # Device name with outline
+    put_text_with_outline(
         frame,
         f"Device: {device}",
         (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
         0.8,
         (0, 255, 0),
         2
     )
-    # Inference time
-    cv2.putText(
+    # Inference time with outline
+    put_text_with_outline(
         frame,
         f"Inference: {inference_ms:.0f} ms",
         (20, 75),
-        cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
         (0, 255, 0),
         2
     )
-    # Inference FPS (derived)
+    # Inference FPS (derived) with outline
     inf_fps = (1000.0 / inference_ms) if inference_ms and inference_ms > 0 else 0.0
-    cv2.putText(
+    put_text_with_outline(
         frame,
         f"Inference FPS: {inf_fps:.2f}",
         (20, 110),
-        cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
         (0, 255, 0),
         2
     )
-    # Actual loop FPS (smoothed)
-    cv2.putText(
+    # Actual loop FPS (smoothed) with outline
+    put_text_with_outline(
         frame,
         f"Actual loop FPS: {loop_fps:.2f}",
         (20, 145),
-        cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
         (0, 255, 0),
         2
