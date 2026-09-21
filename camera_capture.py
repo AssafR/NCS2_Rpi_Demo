@@ -14,15 +14,18 @@ are replaced by newer ones instead of piling up in the app.
 
 import multiprocessing
 import queue
-import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
-from typing import Generator, Optional, Tuple
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+
+
+def ratio_or_zero(numerator: float, denominator: float) -> float:
+    """Return numerator / denominator, or 0.0 when the denominator is zero."""
+    return numerator / denominator if denominator else 0.0
 
 
 @dataclass
@@ -92,39 +95,19 @@ class CaptureDiagnostics:
         """Return the current summary and start a fresh measurement window."""
         elapsed_seconds = time.perf_counter() - self.report_start_time
         report = CaptureReport(
-            capture_fps=self.successful_reads / elapsed_seconds if elapsed_seconds > 0 else 0.0,
-            average_read_ms=self.total_read_ms / self.read_attempts if self.read_attempts else 0.0,
-            average_read_cpu_ms=self.total_read_cpu_ms / self.read_attempts if self.read_attempts else 0.0,
+            capture_fps=ratio_or_zero(self.successful_reads, elapsed_seconds),
+            average_read_ms=ratio_or_zero(self.total_read_ms, self.read_attempts),
+            average_read_cpu_ms=ratio_or_zero(self.total_read_cpu_ms, self.read_attempts),
             maximum_read_ms=self.maximum_read_ms,
-            average_loop_gap_ms=(
-                self.total_loop_gap_ms / self.loop_gap_count if self.loop_gap_count else 0.0
-            ),
-            average_lock_wait_ms=(
-                self.total_lock_wait_ms / self.successful_reads if self.successful_reads else 0.0
-            ),
-            average_shared_copy_ms=(
-                self.total_shared_copy_ms / self.successful_reads if self.successful_reads else 0.0
+            average_loop_gap_ms=ratio_or_zero(self.total_loop_gap_ms, self.loop_gap_count),
+            average_lock_wait_ms=ratio_or_zero(self.total_lock_wait_ms, self.successful_reads),
+            average_shared_copy_ms=ratio_or_zero(
+                self.total_shared_copy_ms, self.successful_reads
             ),
             failed_reads=self.failed_reads,
             replaced_frames=self.replaced_frames,
         )
-        self.reset()
         return report
-
-    def reset(self) -> None:
-        """Clear counters and begin a new diagnostic time window."""
-        self.report_start_time = time.perf_counter()
-        self.read_attempts = 0
-        self.successful_reads = 0
-        self.failed_reads = 0
-        self.total_read_ms = 0.0
-        self.total_read_cpu_ms = 0.0
-        self.maximum_read_ms = 0.0
-        self.total_loop_gap_ms = 0.0
-        self.loop_gap_count = 0
-        self.total_lock_wait_ms = 0.0
-        self.total_shared_copy_ms = 0.0
-        self.replaced_frames = 0
 
 
 def setup_webcam(
@@ -141,8 +124,8 @@ def setup_webcam(
     """
     cap = cv2.VideoCapture(camera_id, cv2.CAP_V4L2)
     # Some cameras slow down when OpenCV requests a one-frame V4L2 buffer.
-    # Leave the driver buffer alone by default. CameraFrameGrabber still keeps
-    # only one newest frame inside this app, so old app-level frames are replaced.
+    # Leave the driver buffer alone. ProcessCameraFrameGrabber keeps only one
+    # newest frame inside this app, so old app-level frames are replaced.
     if buffer_size is not None:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -159,129 +142,6 @@ def setup_webcam(
         f"camera reports {actual_width:.0f}x{actual_height:.0f} at {actual_fps:.1f} FPS."
     )
     return cap
-
-
-@contextmanager
-def open_webcam(
-    camera_id: int,
-    width: int,
-    height: int,
-    fps: int,
-    buffer_size: Optional[int] = None,
-) -> Generator[cv2.VideoCapture, None, None]:
-    """Context manager wrapper for the webcam capture.
-
-    Usage:
-        with open_webcam(CAMERA_ID, CAMERA_W, CAMERA_H, CAMERA_FPS) as cap:
-            ... use cap ...
-
-    Ensures cap.release() is always called, even if an exception occurs.
-    """
-    cap = setup_webcam(camera_id, width, height, fps, buffer_size)
-    try:
-        yield cap
-    finally:
-        cap.release()
-
-
-class CameraFrameGrabber:
-    """Read camera frames in a background thread.
-
-    The thread only grabs frames and stores the latest one. It does not run
-    the model and it does not draw anything.
-
-    Important idea for students:
-    - We keep one newest frame, not a long list of frames.
-    - Each successful camera read gets the next frame number: 1, 2, 3, ...
-    - The model can use each frame number only once.
-
-    The frame number is important if the camera is slow or times out. In that
-    case, the old image is still stored here, but it is not a new image.
-    """
-
-    def __init__(self, cap: cv2.VideoCapture) -> None:
-        self.cap = cap
-        self.latest_frame: Optional[object] = None
-        self.latest_capture_time: float = 0.0
-        self.latest_frame_number: int = 0
-        self._lock = threading.Lock()
-        self._frame_condition = threading.Condition(self._lock)
-        self._frame_available = threading.Event()
-        self._running = True
-        self._diagnostics = CaptureDiagnostics()
-
-    def run(self) -> None:
-        """Capture loop for the background thread."""
-        while self._running:
-            read_start_time = time.perf_counter()
-            read_start_cpu_time = time.thread_time()
-            ret, frame = self.cap.read()
-            read_time_ms = (time.perf_counter() - read_start_time) * 1000.0
-            read_cpu_time_ms = (time.thread_time() - read_start_cpu_time) * 1000.0
-
-            with self._lock:
-                self._diagnostics.record_read(read_time_ms, read_cpu_time_ms)
-
-            if not ret:
-                with self._lock:
-                    self._diagnostics.record_failure()
-                time.sleep(0.05)
-                continue
-
-            capture_time = time.perf_counter()
-            with self._frame_condition:
-                replaced_frame = self.latest_frame is not None
-                self.latest_frame = frame
-                self.latest_capture_time = capture_time
-                self.latest_frame_number += 1
-                self._diagnostics.record_success(replaced_frame=replaced_frame)
-                self._frame_available.set()
-                self._frame_condition.notify_all()
-
-    def stop(self) -> None:
-        """Tell the background thread to stop."""
-        self._running = False
-        self._frame_available.set()
-
-    def wait_for_frame(self, timeout: float = 0.1) -> bool:
-        """Wait until at least one frame has been captured."""
-        return self._frame_available.wait(timeout)
-
-    def wait_for_new_frame(self, previous_frame_number: int, timeout: float = 0.1) -> bool:
-        """Wait until the camera captures a frame newer than the previous one.
-
-        This fixes a stale-frame bug:
-        an "image is available" signal stays true after the first image.
-        If the camera later times out, that signal alone could make the model
-        process the same old image again and again. Frame numbers let us ask
-        the clearer question: "Did a new camera image arrive?"
-        """
-        with self._frame_condition:
-            return self._frame_condition.wait_for(
-                lambda: self.latest_frame_number > previous_frame_number or not self._running,
-                timeout,
-            )
-
-    def get_latest_frame(self) -> Tuple[Optional[object], float, int]:
-        """Return a copy of the latest frame, its capture time, and its number."""
-        with self._lock:
-            if self.latest_frame is None:
-                return None, 0.0, 0
-            return self.latest_frame.copy(), self.latest_capture_time, self.latest_frame_number
-
-    def get_latest_frame_number(self) -> int:
-        """Return the number of the newest frame without copying the image."""
-        with self._lock:
-            return self.latest_frame_number
-
-    def take_diagnostics(self) -> CaptureReport:
-        """Return capture statistics since the previous diagnostic report.
-
-        The thread version has no shared-memory handoff, so its loop-gap,
-        lock-wait, and frame-copy values stay zero.
-        """
-        with self._lock:
-            return self._diagnostics.take_report()
 
 
 def _capture_process_worker(
@@ -344,6 +204,7 @@ def _capture_process_worker(
 
             if time.perf_counter() - diagnostics.report_start_time >= 5.0:
                 diagnostic_queue.put(diagnostics.take_report())
+                diagnostics = CaptureDiagnostics()
     finally:
         cap.release()
         shared_frame_memory.close()

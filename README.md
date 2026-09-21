@@ -201,6 +201,13 @@ total delay:              about 350 to 400 ms
   inference process copies that image when it is ready. New images replace
   old images; they do not form a backlog.
 
+### Possible Future Improvement
+
+One small follow-up idea is to replace the `wait_for_new_frame` polling loop
+with a blocking signal such as an event or condition variable. The current
+version is simple and works well enough, but a blocking wait would avoid the
+10 ms check loop if we want to revisit this later.
+
 ### After: Camera Process And Inference Process
 
 The production app now uses this design:
@@ -224,6 +231,56 @@ of old frames. The model therefore works on a recent image when it is ready.
 In simple words:
 
 > The camera gets its own process, so slow CPU inference does not block camera reads in the main process.
+
+### Thermal Throttling Is A Separate Bottleneck
+
+Even after fixing the camera pipeline, CPU inference can become slow if the
+Raspberry Pi gets too hot. During testing, the Pi behaved normally below about
+80 degrees C. When it reached 80.1 degrees C, this command changed:
+
+```bash
+vcgencmd get_throttled
+```
+
+```text
+temp=79.5'C   throttled=0x0
+temp=80.1'C   throttled=0x20002
+```
+
+`0x20002` means two things:
+
+- `0x2`: the Pi is reducing CPU frequency right now.
+- `0x20000`: frequency capping has happened at least once since boot.
+
+This matters because a slower CPU can make both model inference and camera
+delivery less regular:
+
+```text
+high temperature
+-> CPU frequency is capped
+-> CPU model takes longer
+-> camera and USB driver work may wait longer
+-> display delay grows
+```
+
+To monitor while the demo is running, open a second terminal and run:
+
+```bash
+while true; do
+  date
+  vcgencmd measure_temp
+  vcgencmd get_throttled
+  sleep 2
+done
+```
+
+Press `Ctrl+C` in that second terminal to stop the monitor. The healthy value
+is `throttled=0x0`. A historical flag such as `0x20000` stays until reboot,
+but the current `0x2` part should disappear after the Pi cools.
+
+Use a heatsink, fan, and open airflow when demonstrating CPU inference for a
+long time. The NCS2/MYRIAD device reduces this thermal pressure because model
+inference happens outside the Raspberry Pi CPU.
 
 ## Why Frames Have Numbers
 
