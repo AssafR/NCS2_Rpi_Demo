@@ -201,8 +201,10 @@ def inference_loop(capture_grabber: ProcessCameraFrameGrabber, model_runner: Pos
 
         # Copy the newest sampled frame so the capture thread can keep running.
         frame_for_processing, frame_capture_time, frame_number = capture_grabber.get_latest_frame()
+        frame_received_time = time.perf_counter()
         if frame_for_processing is None:
             continue
+        camera_to_main_delay_ms = (frame_received_time - frame_capture_time) * 1000.0
         # Remember this number before inference starts. The next loop must wait
         # for a newer frame number, even if the camera has a temporary timeout.
         last_processed_frame_number = frame_number
@@ -254,7 +256,8 @@ def inference_loop(capture_grabber: ProcessCameraFrameGrabber, model_runner: Pos
         #   - res['frame']    : the same frame we passed in
         #   - res['elapsed_ms']: inference time in milliseconds
         model_call_start_time = time.perf_counter()
-        frame_wait_before_model_ms = (model_call_start_time - frame_capture_time) * 1000.0
+        main_setup_delay_ms = (model_call_start_time - frame_received_time) * 1000.0
+        frame_wait_before_model_ms = camera_to_main_delay_ms + main_setup_delay_ms
         res = model_runner.run_inference(frame_for_processing)
         inference_finished_time = time.perf_counter()
         full_model_call_ms = (inference_finished_time - model_call_start_time) * 1000.0
@@ -330,32 +333,30 @@ def inference_loop(capture_grabber: ProcessCameraFrameGrabber, model_runner: Pos
         # This lets us compare camera work, model work, and the rest of the path.
         now = time.perf_counter()
         if now - last_diagnostic_report_time >= DIAGNOSTIC_REPORT_SECONDS:
-            (
-                capture_fps,
-                average_read_ms,
-                average_read_cpu_ms,
-                maximum_read_ms,
-                failed_reads,
-                replaced_frames,
-            ) = (
-                capture_grabber.take_diagnostics()
-            )
+            capture_report = capture_grabber.take_diagnostics()
             newer_frames = capture_grabber.get_latest_frame_number() - frame_number
             load_average = os.getloadavg()[0] if hasattr(os, "getloadavg") else 0.0
 
             print(
                 "\n--- Pipeline diagnostic ---\n"
                 f"Device: {device_name}\n"
-                f"Camera: {capture_fps:.1f} frames/s, read average {average_read_ms:.1f} ms, "
-                f"read CPU {average_read_cpu_ms:.1f} ms, read maximum {maximum_read_ms:.1f} ms, "
-                f"failed reads {failed_reads}\n"
-                f"Frame wait before model: {frame_wait_before_model_ms:.1f} ms\n"
+                f"Camera: {capture_report.capture_fps:.1f} frames/s, "
+                f"read average {capture_report.average_read_ms:.1f} ms, "
+                f"read CPU {capture_report.average_read_cpu_ms:.1f} ms, "
+                f"read maximum {capture_report.maximum_read_ms:.1f} ms, "
+                f"failed reads {capture_report.failed_reads}\n"
+                f"Camera loop gap: {capture_report.average_loop_gap_ms:.1f} ms\n"
+                f"Shared frame: lock wait {capture_report.average_lock_wait_ms:.1f} ms, "
+                f"copy {capture_report.average_shared_copy_ms:.1f} ms\n"
+                f"Camera to main process: {camera_to_main_delay_ms:.1f} ms\n"
+                f"Main setup before model: {main_setup_delay_ms:.1f} ms\n"
+                f"Total frame wait before model: {frame_wait_before_model_ms:.1f} ms\n"
                 f"Model call: {full_model_call_ms:.1f} ms, network only: {inference_ms:.1f} ms\n"
                 f"Device switch in this frame: {device_switch_ms:.1f} ms\n"
                 f"After model: {post_processing_ms:.1f} ms, JPEG: {jpeg_encoding_ms:.1f} ms\n"
                 f"Ready to send delay: {ready_to_send_delay_ms:.1f} ms\n"
                 f"Newer frames captured during this model pass: {newer_frames}\n"
-                f"Older frames replaced in the last report: {replaced_frames}\n"
+                f"Older frames replaced in the last report: {capture_report.replaced_frames}\n"
                 f"System load average (1 minute): {load_average:.2f}\n"
                 "---------------------------"
             )
@@ -378,8 +379,8 @@ def inference_loop(capture_grabber: ProcessCameraFrameGrabber, model_runner: Pos
 #   slowing down V4L2 camera reads in the main process.
 # - The inference loop uses one daemon thread, so the main thread can serve
 #   HTTP requests without waiting for inference to finish.
-# - The camera process sends only its newest frame. Old queued frames are
-#   replaced instead of forming a long queue.
+# - The camera process writes only its newest frame into shared memory. A newer
+#   frame replaces the old one instead of forming a long queue.
 # - Shared data in this process is minimized: one `latest_jpeg` buffer guarded
 #   by a lock, plus simple device and heatmap request flags.
 

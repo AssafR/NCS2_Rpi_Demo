@@ -18,6 +18,7 @@ This is a diagnostic only. It does not stream video or draw pose results.
 import argparse
 import multiprocessing
 import queue
+import threading
 import time
 
 import numpy as np
@@ -111,6 +112,11 @@ def main() -> None:
         action="store_true",
         help="Do not request OpenCV/V4L2's one-frame buffer limit.",
     )
+    parser.add_argument(
+        "--inference-thread",
+        action="store_true",
+        help="Run inference in a background thread, like webcam_web.py does.",
+    )
     args = parser.parse_args()
 
     buffer_size = None if args.no_buffer_limit else 1
@@ -139,16 +145,40 @@ def main() -> None:
 
     if args.device == "NONE":
         print(f"Running separate-process capture only for {args.seconds:.0f} seconds.")
+    elif args.inference_thread:
+        print(
+            f"Running {args.device} inference in a background thread and "
+            f"separate-process capture for {args.seconds:.0f} seconds."
+        )
     else:
         print(f"Running {args.device} inference and separate-process capture for {args.seconds:.0f} seconds.")
     inference_count = 0
     inference_total_ms = 0.0
+    inference_stats_lock = threading.Lock()
+    inference_stop_event = threading.Event()
+
+    def run_inference_in_thread() -> None:
+        """Run repeated model calls using the same thread pattern as the web app."""
+        nonlocal inference_count, inference_total_ms
+        while not inference_stop_event.is_set():
+            result = model_runner.run_inference(test_frame)
+            with inference_stats_lock:
+                inference_count += 1
+                inference_total_ms += result["elapsed_ms"]
+
+    model_thread = None
+    if model_runner is not None and args.inference_thread:
+        model_thread = threading.Thread(target=run_inference_in_thread, daemon=True)
+        model_thread.start()
+
     report_time = time.perf_counter()
     finish_time = report_time + args.seconds
 
     try:
         while time.perf_counter() < finish_time:
             if model_runner is None:
+                time.sleep(0.05)
+            elif args.inference_thread:
                 time.sleep(0.05)
             else:
                 result = model_runner.run_inference(test_frame)
@@ -158,13 +188,18 @@ def main() -> None:
             now = time.perf_counter()
             if now - report_time >= REPORT_SECONDS:
                 if model_runner is not None:
-                    average_model_ms = inference_total_ms / inference_count if inference_count else 0.0
-                    print(f"Model process: {inference_count} inferences, average {average_model_ms:.1f} ms")
+                    with inference_stats_lock:
+                        average_model_ms = inference_total_ms / inference_count if inference_count else 0.0
+                        report_inference_count = inference_count
+                        inference_count = 0
+                        inference_total_ms = 0.0
+                    print(f"Model calls: {report_inference_count}, average {average_model_ms:.1f} ms")
                 print_camera_reports(report_queue)
-                inference_count = 0
-                inference_total_ms = 0.0
                 report_time = now
     finally:
+        inference_stop_event.set()
+        if model_thread is not None:
+            model_thread.join(timeout=2.0)
         stop_event.set()
         camera_process.join(timeout=2.0)
         if camera_process.is_alive():

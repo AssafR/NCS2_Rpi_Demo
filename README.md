@@ -80,6 +80,7 @@ timing reports. It does not open the web page or show pose results.
 python3 diagnose_capture_process.py --device CPU --seconds 30
 python3 diagnose_capture_process.py --device MYRIAD --seconds 30
 python3 diagnose_capture_process.py --device NONE --seconds 30
+python3 diagnose_capture_process.py --device CPU --seconds 30 --no-buffer-limit --inference-thread
 ```
 
 How to read the result:
@@ -88,6 +89,11 @@ How to read the result:
   thread arrangement in the web app is likely interfering with capture.
 - Camera becomes slow even in this test: the problem is more likely in the
   camera, V4L2 driver, USB connection, or whole-system resource use.
+
+The `--inference-thread` option matches the web app more closely. It runs the
+model in a background thread while the camera remains in a separate process.
+Use it when you want to test whether the model's thread scheduling affects
+camera capture.
 
 For a second camera-only comparison, omit the one-frame OpenCV buffer request:
 
@@ -137,6 +143,64 @@ These tests showed that the webcam can keep its normal speed while CPU
 inference runs in another process. The main problem was the old design where
 camera capture and CPU inference shared one Python process.
 
+### What We Measured Before And After
+
+These are example measurements from this Raspberry Pi, webcam, and pose model.
+They are useful for learning, but another camera or Raspberry Pi may give
+different numbers.
+
+| Device and design | Camera | Model time | Ready-to-send delay | What it meant |
+| --- | --- | --- | --- | --- |
+| CPU before the fixes | Often 0.2 to 1.9 FPS | About 2500 ms | Sometimes 3000 to 12000 ms | Camera reads were slow and uneven. Extra waiting was not explained by drawing or JPEG work. |
+| MYRIAD with the old one-buffer request | About 2.3 to 2.5 FPS | About 280 to 300 ms | About 310 ms | The model was fast, but the requested V4L2 one-frame buffer reduced camera speed. |
+| CPU after the fixes | About 5 FPS | About 2600 to 2800 ms | About 2800 to 3000 ms | CPU inference is slow, but the extra delay is now small and predictable. |
+| MYRIAD after the capture fixes | About 4.6 to 5 FPS | About 280 to 300 ms | About 350 to 400 ms | Fast model inference and normal camera delivery. |
+
+The CPU result is expected. At 5 FPS, the camera makes one image every
+200 ms. When a slow model becomes ready, the newest camera image may already
+be between 0 and 200 ms old. Drawing and JPEG encoding add about 25 to 30 ms.
+
+For example, a healthy CPU result looks like this:
+
+```text
+camera age before model: about 100 to 170 ms
+CPU model:                about 2600 to 2800 ms
+drawing and JPEG:         about 25 to 30 ms
+total delay:              about 2800 to 3000 ms
+```
+
+The same idea for MYRIAD:
+
+```text
+camera age before model: about 0 to 200 ms
+MYRIAD model:             about 280 to 300 ms
+drawing and JPEG:         about 25 to 30 ms
+total delay:              about 350 to 400 ms
+```
+
+### Bug Fixes Along The Way
+
+1. **Do not request `CAP_PROP_BUFFERSIZE = 1`.**
+  The webcam worked at about 5 FPS by itself, but this OpenCV/V4L2 setting
+  reduced it to about 2.5 FPS. The camera code now leaves the driver buffer
+  unchanged.
+
+2. **Give the camera its own process.**
+  The old camera thread shared a Python process with CPU inference. The new
+  camera process owns V4L2 capture, so slow model work cannot directly block
+  the camera read in the main process.
+
+3. **Give every successful frame a number.**
+  The inference loop waits for a higher number before it runs again. This
+  prevents it from processing one stale frame many times during a camera
+  timeout.
+
+4. **Use one shared-memory newest-frame slot.**
+  Sending full images through a multiprocessing queue can add uneven waiting.
+  The camera now writes the newest image into shared memory instead. The
+  inference process copies that image when it is ready. New images replace
+  old images; they do not form a backlog.
+
 ### After: Camera Process And Inference Process
 
 The production app now uses this design:
@@ -145,7 +209,7 @@ The production app now uses this design:
 camera process
   reads the webcam
   keeps only the newest frame
-  sends newest frame -> one-item queue
+  writes newest frame -> shared-memory slot
 
 main process
   runs CPU or MYRIAD inference
@@ -153,9 +217,9 @@ main process
   sends JPEG images to the browser
 ```
 
-The one-item queue is important. If the model is slow, a newer camera frame
-replaces an older queued frame. The app does not build a long list of old
-frames. The model therefore works on a recent image when it is ready.
+The shared-memory slot is important. If the model is slow, a newer camera
+frame replaces the old frame in that slot. The app does not build a long list
+of old frames. The model therefore works on a recent image when it is ready.
 
 In simple words:
 
@@ -181,6 +245,51 @@ no new camera frame -> no new number -> wait
 
 This prevents a stale image from being processed repeatedly during a camera
 timeout.
+
+### Successful And Unsuccessful Camera Reads
+
+The camera code asks OpenCV for an image like this:
+
+```python
+ok, frame = cap.read()
+```
+
+- `ok` is `True`: the camera gave OpenCV a real new image. This is a
+  successful read, so the frame number increases.
+- `ok` is `False`: the camera did not give OpenCV an image. This can happen
+  when the camera is slow, disconnected, or V4L2 reports a timeout. This is
+  an unsuccessful read, so there is no new frame number.
+
+The important bug was not that an unsuccessful read created a bad image. The
+old image was still stored in memory after the last successful read. Without
+frame numbers, the model could process that same old image again and again:
+
+```text
+camera captures frame 10
+model processes frame 10
+camera times out
+old frame 10 is still stored
+model processes frame 10 again
+```
+
+Frame numbers change the question from:
+
+```text
+Do we have any frame?
+```
+
+to:
+
+```text
+Did a newer frame arrive?
+```
+
+The current rule is simple:
+
+```text
+successful capture -> frame number increases -> model may process it once
+unsuccessful capture -> frame number does not change -> model waits
+```
 
 ## Model-only Quickstart (no web server)
 
