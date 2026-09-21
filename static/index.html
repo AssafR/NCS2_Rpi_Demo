@@ -26,8 +26,10 @@
   <div>
     <button onclick="setDevice('CPU')">Raspberry Pi CPU</button>
     <button onclick="setDevice('MYRIAD')">Intel NCS2</button>
+    <button id="heatmap-button" onclick="toggleHeatmaps()">Show heatmaps</button>
   </div>
   <div class="note">Same CNN. Same camera. Different inference hardware.</div>
+  <div class="note">Heatmaps are hidden at first. Click “Show heatmaps” to see the model activation maps.</div>
   <!-- The <img> tag points to the MJPEG endpoint (a stream of JPEG images) served by Python -->
   <img src="/video" alt="Video stream" />
   <script src="/static/js/app.js"></script>

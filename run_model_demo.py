@@ -74,7 +74,7 @@ def main():
                 continue
 
             # Run the model and get structured results
-            res = runner.run(frame)
+            res = runner.run_inference(frame)
             device_name = res["device"]
             inference_ms = res["elapsed_ms"]
             points = res["points"]

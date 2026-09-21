@@ -15,8 +15,8 @@ lesson focused on "glue code" and system wiring.
 # FILE MAP (for students):
 # 1) Configuration constants (model path, camera size, port)
 # 2) Webcam helper (setup_webcam)
-# 3) Shared state (latest_jpeg, requested_device)
-# 4) Callbacks used by the HTTP server (get_latest_jpeg_callback, request_device_callback, is_running_callback)
+# 3) Shared state (latest_jpeg, requested_device, requested_heatmaps)
+# 4) Callbacks used by the HTTP server (get_latest_jpeg_callback, request_device_callback, request_heatmaps_callback, is_running_callback)
 # 5) Inference loop (capture → infer → visualize → compress)
 # 6) main() and the if __name__ == "__main__" guard (startup and shutdown)
 
@@ -33,7 +33,13 @@ import cv2
 # pose_result_processor.py, and the HTTP server lives in server_handler.py. This
 # separation makes lessons clearer: execution vs visualization vs serving.
 from pose_model_runner import PoseModelRunner
-from pose_result_processor import render_pose_on_frame, annotate_metrics
+from pose_result_processor import (
+    render_pose_on_frame,
+    annotate_metrics,
+    heatmap_to_image,
+    heatmaps_grid_to_image,
+)
+from pose_defs import BODY_PARTS
 from server_handler import create_handler
 
 
@@ -140,6 +146,10 @@ frame_lock: threading.Lock = threading.Lock()
 #   the next one.
 requested_device: Optional[str] = None
 
+# None means "no new request". True means show the grid; False means hide it.
+# The inference loop reads and clears this request between frames.
+requested_heatmaps: Optional[bool] = None
+
 running: bool = True
 
 ## Pose estimation and result processing are handled in external modules
@@ -177,6 +187,12 @@ def request_device_callback(name: str) -> None:
     requested_device = name
 
 
+def request_heatmaps_callback(show: bool) -> None:
+    """Callback: ask the inference loop to show or hide the heatmap grid."""
+    global requested_heatmaps
+    requested_heatmaps = show
+
+
 def is_running_callback() -> bool:
     """Callback: return True while the application is active.
 
@@ -203,8 +219,10 @@ def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None
     """
     global latest_jpeg  # Optional[bytes]
     global requested_device  # Optional[str]
+    global requested_heatmaps  # Optional[bool]
 
     smoothed_loop_fps: Optional[float] = None
+    show_heatmaps: bool = False  # Start hidden. The user can show them from the web page.
 
     last_frame_time: float = (
         time.perf_counter()
@@ -253,6 +271,11 @@ def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None
             ok = model_runner.set_device(to_set)
             print("Switch successful." if ok else "Switch failed.")
 
+        # Apply a requested heatmap show/hide change between frames.
+        if requested_heatmaps is not None:
+            show_heatmaps = requested_heatmaps
+            requested_heatmaps = None
+
         frame_for_processing = frame
         # Use the new PoseModelRunner to execute and obtain results
         # Ask the model runner to execute the CNN on this frame.
@@ -262,7 +285,7 @@ def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None
         #   - res['device']   : which device ran the model (CPU / MYRIAD)
         #   - res['frame']    : the same frame we passed in
         #   - res['elapsed_ms']: inference time in milliseconds
-        res = model_runner.run(frame_for_processing)
+        res = model_runner.run_inference(frame_for_processing)
 
         device_name = res["device"]
         inference_ms = res["elapsed_ms"]
@@ -270,6 +293,19 @@ def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None
         # Draw the skeleton using the decoded keypoints (visualization step).
         points = res["points"]
         render_pose_on_frame(frame_for_processing, points)
+
+        # The heatmap grid is optional. It starts hidden so the first view is
+        # the simple camera image and stick figure.
+        if show_heatmaps:
+            # Remove batch dimension: [1, num_parts, h, w] -> [num_parts, h, w]
+            raw_heatmaps = res["heatmaps"]
+            heatmaps_3d = raw_heatmaps[0]
+            heat_img = heatmaps_grid_to_image(
+                heatmaps_3d,
+                (frame_for_processing.shape[1], frame_for_processing.shape[0]),
+                BODY_PARTS,
+                cols=5,
+            )
 
         # Update FPS calculations (simple approach using elapsed time)
         now = time.perf_counter()
@@ -292,10 +328,15 @@ def inference_loop(cap: cv2.VideoCapture, model_runner: PoseModelRunner) -> None
             smoothed_loop_fps,
         )
 
-        # Compress the annotated frame to JPEG for streaming over HTTP
+        # If enabled, put the heatmap grid to the right of the camera image.
+        output_image = frame_for_processing
+        if show_heatmaps:
+            output_image = cv2.hconcat([frame_for_processing, heat_img])
+
+        # Compress the output image to JPEG for streaming over HTTP
         success, jpeg = cv2.imencode(
             ".jpg",
-            frame_for_processing,
+            output_image,
             [cv2.IMWRITE_JPEG_QUALITY, 80]
         )
 
@@ -357,6 +398,7 @@ def main() -> None:
             static_dir,
             get_latest_jpeg_callback,  # how to fetch the latest JPEG bytes
             request_device_callback,    # how to signal a requested device change
+            request_heatmaps_callback,  # how to show or hide the heatmap grid
             is_running_callback,        # how to know when to stop streaming
         )
 

@@ -2,7 +2,7 @@
 pose_result_processor.py
 ------------------------
 
-Simple drawing helpers for students. These functions take the results from
+Simple drawing helpers. These functions take the results from
 the model runner (points, heatmaps, timings) and draw on images or create a
 mask. We keep drawing separate from model code so it is easier to learn:
 "what the model gives" vs "how we show it".
@@ -10,6 +10,8 @@ mask. We keep drawing separate from model code so it is easier to learn:
 
 import cv2
 import numpy as np
+from typing import Tuple, List, Optional
+import math
 from pose_defs import POSE_PAIRS  # Shared source of truth for skeleton edges
 
 def render_pose_on_frame(frame, points, color=(0, 255, 0)):
@@ -57,6 +59,93 @@ def overlay_mask(frame, mask):
         colored = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         return cv2.addWeighted(frame, 0.8, colored, 0.2, 0)
     return frame
+
+
+def heatmap_to_image(heatmap: np.ndarray, out_size: Tuple[int, int]) -> np.ndarray:
+    """Convert one heatmap channel into a color image for display.
+
+    Steps (simple for students):
+    1) Normalize values to 0..255 (uint8)
+    2) Resize to match the given output size (width, height)
+    3) Apply a color map so high values are brighter/warmer
+    """
+    # Normalize heatmap to [0, 255]
+    hm = heatmap.astype(np.float32)
+    min_val, max_val = float(hm.min()), float(hm.max())
+    if max_val - min_val > 1e-6:
+        hm = (hm - min_val) / (max_val - min_val)
+    else:
+        hm = hm * 0.0
+    hm_uint8 = (hm * 255).astype(np.uint8)
+
+    # Resize to output size
+    w, h = out_size
+    hm_resized = cv2.resize(hm_uint8, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    # Apply color map for easier viewing
+    heat_color = cv2.applyColorMap(hm_resized, cv2.COLORMAP_JET)
+    return heat_color
+
+
+def heatmaps_grid_to_image(
+    heatmaps_3d: np.ndarray,
+    frame_size: Tuple[int, int],
+    part_names: Optional[List[str]] = None,
+    cols: int = 5,
+) -> np.ndarray:
+    """Build a grid image from all heatmap channels, matching frame height.
+
+    Args:
+        heatmaps_3d: array shaped [num_parts, h, w]
+        frame_size: (frame_width, frame_height) used to set grid height
+        part_names: optional list of names to draw on each tile
+        cols: number of columns in the grid (default 5)
+
+    Returns:
+        BGR image with size (grid_width, frame_height, 3)
+    """
+    fw, fh = frame_size
+    num_parts = int(heatmaps_3d.shape[0])
+    rows = int(math.ceil(num_parts / float(cols))) if num_parts > 0 else 1
+
+    # Tile size tries to fill the frame height with the chosen number of rows
+    tile_h = max(1, fh // rows)
+    tile_w = tile_h  # square tiles for a simple layout
+
+    tiles: List[np.ndarray] = []
+    for i in range(rows * cols):
+        if i < num_parts:
+            tile = heatmap_to_image(heatmaps_3d[i], (tile_w, tile_h))
+            if part_names and i < len(part_names):
+                cv2.putText(
+                    tile,
+                    part_names[i],
+                    (5, 15),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1,
+                )
+        else:
+            tile = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
+        tiles.append(tile)
+
+    # Assemble rows then stack vertically
+    row_images: List[np.ndarray] = []
+    for r in range(rows):
+        row_tiles = tiles[r * cols : (r + 1) * cols]
+        row_img = cv2.hconcat(row_tiles)
+        row_images.append(row_img)
+
+    grid = cv2.vconcat(row_images)
+
+    # Ensure final grid height exactly matches frame height
+    gh, gw = grid.shape[:2]
+    if gh != fh:
+        scale = fh / float(gh)
+        grid = cv2.resize(grid, (int(gw * scale), fh), interpolation=cv2.INTER_LINEAR)
+
+    return grid
 
 def annotate_metrics(frame, device: str, inference_ms: float, loop_fps: float):
     """Draw text: device name, inference time (ms), and FPS.

@@ -2,14 +2,14 @@
 pose_model_runner.py
 --------------------
 
-Beginner-friendly wrapper around an OpenVINO pose-estimation model.
+Simple wrapper around an OpenVINO pose-estimation model.
 
-This module is responsible ONLY for:
-- Loading the model and compiling it for a target device (CPU or MYRIAD)
-- Preparing input frames and running inference
-- Returning simple results that other code can use
+This module does only these things:
+- Load the model and prepare it for a target device (CPU or MYRIAD)
+- Prepare input frames and run inference
+- Return simple results that other code can use
 
-It does NOT draw on images or serve HTTP. That separation keeps lessons clear:
+It does NOT draw on images or serve HTTP. This separation helps you understand:
 - "Model execution" (here)
 - "Result processing / visualization" (pose_result_processor.py)
 - "Web serving" (server_handler.py used by webcam_web.py)
@@ -20,7 +20,7 @@ Quickstart (model-only):
     from pose_result_processor import render_pose_on_frame, annotate_metrics
     import cv2
 
-    runner = PoseModelRunner(
+    model_runner = PoseModelRunner(
         "model/human-pose-estimation-0001.xml",
         initial_device="CPU",
         model_w=456,
@@ -31,7 +31,7 @@ Quickstart (model-only):
         ok, frame = cap.read()
         if not ok:
             continue
-        res = runner.run(frame)
+        res = runner.run_inference(frame)
         render_pose_on_frame(frame, res["points"])  # draw skeleton
         annotate_metrics(frame, res["device"], res["elapsed_ms"], 0.0)
         cv2.imshow("Pose", frame)
@@ -52,9 +52,9 @@ from pose_defs import BODY_PARTS as DEF_BODY_PARTS, POSE_PAIRS as DEF_POSE_PAIRS
 class PoseModelRunner:
     """Run a pose-estimation model and return structured results.
 
-    Typical usage in the inference loop:
+    Simple usage in the inference loop:
 
-        res = runner.run(frame)
+        res = runner.run_inference(frame)
         # 'res' is a dictionary with several useful fields:
         #   - 'heatmaps': raw model heatmaps (19 channels for body parts)
         #   - 'points'  : decoded keypoints as a dict: name -> (x, y, confidence)
@@ -62,7 +62,7 @@ class PoseModelRunner:
         #   - 'frame'   : the same input frame (not copied)
         #   - 'elapsed_ms': wall-clock inference time in milliseconds
 
-    Keep this class focused on execution so students can clearly see what
+    Keep this class focused on execution so you can clearly see what
     the model "returns" versus how the results are later drawn or served.
     """
     # Pose model definitions (mirrored from the original file)
@@ -79,7 +79,7 @@ class PoseModelRunner:
                                 model_h: int = 256):
         """Initialize the model executor.
 
-        Student note:
+        Note for students:
         - Camera configuration (width/height/FPS) belongs to the capture layer.
             The runner only needs the MODEL's input size (model_w/model_h) and
             which device to target (CPU or MYRIAD).
@@ -126,7 +126,16 @@ class PoseModelRunner:
         return True
 
     def _prepare_frame(self, frame: object):
-        """Resize + NCHW + float32 conversion for model input."""
+        """Prepare an image for the model (simple and clear for students).
+
+        Steps:
+        1) Resize the image to the model input size (model_w, model_h)
+        2) Reorder axes from HWC (height, width, channels) to NCHW
+           (batch, channels, height, width). We also add the batch dimension.
+        3) Convert the data type to float32, as the model expects floats.
+
+        Note: We do not normalize pixel values here beyond the float cast.
+        """
         resized = cv2.resize(frame, (self.model_w, self.model_h))
         tensor = resized.transpose(2, 0, 1)
         tensor = tensor[np.newaxis, ...]
@@ -161,7 +170,7 @@ class PoseModelRunner:
                 points[part_name] = None
         return points
 
-    def run(self, frame: object):
+    def run_inference(self, frame: object):
         """Run one inference pass on the given BGR `frame`.
 
         Returns: dict with keys

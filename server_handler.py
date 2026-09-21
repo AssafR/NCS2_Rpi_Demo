@@ -10,6 +10,7 @@ Routes we serve:
 - "/static/..."  → CSS/JS/assets (from static_dir)
 - "/video"       → MJPEG (a stream of JPEG images) with the latest frame
 - "/device"      → ask the app to switch device (CPU or MYRIAD)
+- "/heatmaps"    → ask the app to show or hide the heatmap grid
 
 This separation makes it easier to learn: web server vs model vs drawing.
 """
@@ -24,6 +25,7 @@ from urllib.parse import urlparse, parse_qs
 def create_handler(static_dir: str,
                    get_latest_jpeg,
                    request_device_callback,
+                   request_heatmaps_callback,
                    is_running):
     """Create a simple HTTP request handler bound to your app callbacks.
 
@@ -31,6 +33,7 @@ def create_handler(static_dir: str,
         static_dir: where index.html and /static files live
         get_latest_jpeg: () -> Optional[bytes], returns most recent JPEG frame
         request_device_callback: (str) -> None, called with 'CPU' or 'MYRIAD'
+        request_heatmaps_callback: (bool) -> None, show or hide the heatmap grid
         is_running: () -> bool, tells the streaming loop when to stop
 
     Returns:
@@ -113,6 +116,24 @@ def create_handler(static_dir: str,
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
                 self.wfile.write((f"Switching to {requested}").encode())
+                return
+
+            # Heatmap grid show/hide request
+            if parsed.path == "/heatmaps":
+                params = parse_qs(parsed.query)
+                show_text = params.get("show", [None])[0]
+                if show_text not in ("0", "1"):
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+
+                show_heatmaps = show_text == "1"
+                request_heatmaps_callback(show_heatmaps)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                message = "Heatmaps shown" if show_heatmaps else "Heatmaps hidden"
+                self.wfile.write(message.encode())
                 return
 
             self.send_response(404)
