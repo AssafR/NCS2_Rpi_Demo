@@ -16,26 +16,6 @@ Before we start:
 - We expected `image_delay - infer_delay` to stay roughly similar on CPU and NPU because the rest of the pipeline was supposed to stay mostly the same. The camera read, frame size, drawing step, and JPEG step should not have changed much.
 - When that gap was very different, it meant something outside the model was changing the result.
 
-## 0. The CPU and NPU timings did not match
-
-### Clue or suspicion
-
-At the start, the gap between `image_delay` and `infer_delay` looked very different on CPU and NPU. That suggested the delay was not only coming from the model.
-
-### Analysis
-
-We looked at the whole path on both CPU and NPU, then split it into smaller parts: camera capture, waiting for frames, model inference, post-processing, JPEG encoding, and serving. That showed the model time was only one part of the total delay.
-
-### Unsuccessful solutions
-
-- Looking only at the raw model time.
-- Assuming the CPU vs NPU gap was just a model speed difference.
-- Treating the whole delay as one number without breaking it into pieces.
-
-### Successful solution
-
-We measured the pipeline in smaller pieces. That gave us the clues we needed for the later fixes: frame handling, buffering, queueing, and thermal behavior.
-
 ## 1. The page showed intermediate images before the newest frame was ready
 
 ### Clue or suspicion
@@ -60,11 +40,15 @@ We changed to a one-frame-at-a-time design. The camera keeps only the newest fra
 
 ### Clue or suspicion
 
-The camera was fast when tested alone, but it became slow and uneven when CPU inference ran in the same Python process. We did not yet know whether the model was blocking the camera or whether something else was happening.
+The camera became slow and uneven when we used CPU inference instead of NPU. That made us suspect that the CPU path was changing how the rest of the program behaved, and the next logical question was whether the camera and the model were sharing too much of the same process time.
 
 ### Analysis
 
 We compared camera-only tests with combined camera + inference tests. We also measured the time spent in different parts of the loop: camera reads, model calls, drawing, JPEG encoding, and waiting for the next frame.
+
+At the start, both camera capture and CPU inference lived in the same Python process. We wanted the camera to keep reading smoothly without being slowed down by the model, so our first idea was to use a thread. That felt like the simplest way to split the camera work from the model work while still keeping the code easy to read.
+
+Before we added threading, the camera read was just part of the same main Python loop. It used direct `cap.read()` calls, not a lock-based design, so the camera and the model were still sharing the same flow of work.
 
 ### Unsuccessful solutions
 
@@ -74,15 +58,17 @@ We compared camera-only tests with combined camera + inference tests. We also me
 
 ### Successful solution
 
-We put camera capture in its own process.
+We put camera capture in its own process. That was the second version of the fix, after the threaded version still shared too much of the same Python process.
+
+The thread was not enough because it still lived inside the same Python process. That meant the camera could still get starved when inference was busy. The separate process gave the camera its own memory space and its own runtime, which reduced starvation better than the thread.
 
 A thread is one worker inside the same worker room. Threads share the same Python process, so if one thread stays busy too long, the other may have to wait.
 
 A process is a separate worker room with its own space. The camera gets its own process, so it has its own place to run. That means the camera can keep reading frames even when the main process is busy with inference.
 
-This stops starvation. The camera is no longer fighting the model for the same time and attention inside one Python process. V4L2 can keep reading from the camera, and the main process can do the model work at the same time.
+This stops starvation. The camera is no longer fighting the model for the same time and attention inside one Python process. V4L2 can keep reading from the camera, and the main process can do the model work at the same time. The first thread idea was simpler, but the separate process was the stronger fix.
 
-## 3. Webcam FPS dropped
+## 3. Webcam FPS dropped after one-frame buffering was requested
 
 ### Clue or suspicion
 
@@ -129,11 +115,11 @@ We gave each successful frame a number. The inference loop now waits for a highe
 
 ### Clue or suspicion
 
-The camera and model were already separated more cleanly, but the app still had uneven delays. We did not yet know what was causing the waiting.
+The camera and model were already separated more cleanly, but the app still had uneven delays. Because the problem was still happening after that split, we suspected the step that moved frames between the two processes.
 
 ### Analysis
 
-We looked at the path where full frames moved between processes. A multiprocessing queue has to copy each image from one process to another, and that copying can add time and jitter.
+That made us look at the path where full frames moved between processes. A multiprocessing queue has to copy each image from one process to another, and that copying can add time and jitter.
 
 ### Unsuccessful solutions
 
@@ -142,9 +128,30 @@ We looked at the path where full frames moved between processes. A multiprocessi
 
 ### Successful solution
 
-We switched to one shared-memory slot for the newest frame. The camera writes the latest image there, and the inference process reads it when ready. Old frames are replaced, not piled up, so there is less copying and less waiting.
+We changed the plan so the transport should carry only the newest frame, not a growing list of old ones. That set up the shared-memory fix in the next section.
 
-## 6. The app felt slow
+## 6. The newest frame still lagged behind
+
+### Clue or suspicion
+
+We still saw the newest frame arrive later than expected, even after the earlier camera and timeout fixes. That told us the new plan still needed a faster way to move one fresh frame forward.
+
+### Analysis
+
+We looked at how full frames moved between processes again. The queue had to copy each image, so the newest frame could sit behind older work.
+
+### Unsuccessful solutions
+
+- Passing full images through a queue as the main transport.
+- Keeping a backlog of older frames.
+
+### Successful solution
+
+We switched to one shared-memory slot for the newest frame. The camera writes the latest image there, and the inference process reads it when ready.
+
+Old frames are replaced, not piled up, so there is less copying and less waiting.
+
+## 7. The timings still did not add up
 
 ### Clue or suspicion
 
@@ -173,7 +180,7 @@ We added diagnostics for:
 
 We split the timing into smaller parts. That made it clear that the camera path, model path, and rendering path each had their own role.
 
-## 7. Image delay sometimes spiked
+## 8. Image delay sometimes spiked
 
 ### Clue or suspicion
 
@@ -192,7 +199,7 @@ That made CPU throttling the next thing to test, because a thermal limit can mak
 
 We documented the thermal issue clearly and treated it as a separate explanation. Cooling, airflow, and using the NCS2/MYRIAD device all help reduce this bottleneck.
 
-## 8. The diagnostic notes kept drifting out of sync
+## 9. The diagnostic notes kept drifting out of sync
 
 ### Clue or suspicion
 
@@ -210,7 +217,7 @@ We looked at the maintenance burden of keeping a reset method updated whenever a
 
 We used dataclasses and let the default values be the source of truth. That made the diagnostics easier to read and less fragile.
 
-## 9. USB looked busy
+## 10. USB looked busy
 
 ### Clue or suspicion
 
