@@ -72,6 +72,10 @@ This stops starvation. The camera is no longer fighting the model for the same t
 
 ### Clue or suspicion
 
+At first, we did not know that the webcam and the V4L2 camera driver could keep their own hidden line of waiting frames. We did not create this driver-level queue in our Python code, and we could not directly control it. When CPU inference kept the program busy, the camera could continue making frames while the program was not calling `cap.read()`. A later `cap.read()` could then return an older frame from the driver's hidden queue instead of the newest live frame.
+
+We tried a one-frame V4L2 buffer because we hoped a smaller driver buffer would reduce this delay by keeping fewer old frames waiting.
+
 When we asked OpenCV for a one-frame V4L2 buffer, the webcam speed dropped from about 5 FPS to about 2.5 FPS. That looked suspicious, but we did not yet know whether the buffer setting was the real cause.
 
 ### Analysis
@@ -81,7 +85,7 @@ We compared the same webcam in two modes:
 - normal driver buffering
 - `CAP_PROP_BUFFERSIZE = 1`
 
-The difference was large enough to show that the buffer request was not helping this camera.
+The difference was large enough to show that the buffer request was not helping this camera. We could not control every detail of the webcam driver's internal buffering, and its behavior can differ between cameras.
 
 ### Unsuccessful solutions
 
@@ -90,66 +94,102 @@ The difference was large enough to show that the buffer request was not helping 
 
 ### Successful solution
 
-We stopped requesting a one-frame buffer. The camera keeps any extra frames on its own, and the program handles stale data in a smarter way.
+For this webcam, forcing a smaller driver buffer did not help. It actually made the camera slower, so we stopped using it. Instead, our own code keeps only the newest app-level frame whenever it can.
 
-## 4. The video looked stuck on the same picture after a timeout
+## 4. The video stayed on the same picture
 
 ### Clue or suspicion
 
-After a camera timeout, the video sometimes looked stuck on the same picture instead of moving to a fresh one. We could see that something was not moving forward, but we did not yet know why.
+The user sometimes saw the video stay on the same picture instead of moving to a fresh one. For a moment, no new picture was being served, so the old picture stayed on screen even though the program expected a new frame to arrive.
 
 ### Analysis
 
-We traced the meaning of `ok, frame = cap.read()`. A failed read does not create a fresh image. It only means the previous image is still there, so the code can be fooled if it asks only, "Do we have a frame?"
+We traced the meaning of `ok, frame = cap.read()`. The bug before was that the app only asked, "Do we have a frame?" If `ok` was false, that meant no new frame arrived, but the old frame could still stay on screen. The fix was to check freshness, not just presence, so the app would wait for a newer frame instead of reusing the old one.
+
+Before the fix, the camera path in [camera_capture.py](q:\RaspberryPi\camera_capture.py#L174) did this in shorthand: 
+
+```python
+ok, frame = cap.read(); 
+if ok: 
+    copy frame and bump frame_number
+```
+
+The problem was on the reading side in [camera_capture.py](q:\RaspberryPi\camera_capture.py#L286): it now waits for `current_frame_number > previous_frame_number`. Before that change, the app could keep showing the old frame when no newer one had arrived.
 
 ### Unsuccessful solutions
 
-- Treating any stored image as if it were new.
-- Letting the inference loop reuse the last buffer without checking freshness.
 
 ### Successful solution
 
-We gave each successful frame a number. The inference loop now waits for a higher number before it runs again. That changes the question from "Do we have a frame?" to "Did a newer frame arrive?"
+We gave each successful frame a number. The inference loop now waits for a higher number before it runs again. That changes the question from "Do we have a frame?" to "Did a newer frame arrive?" This stops the old picture from being treated like a new one.
+
+In [camera_capture.py](q:\RaspberryPi\camera_capture.py#L174) and [camera_capture.py](q:\RaspberryPi\camera_capture.py#L286), the before/after is:
+
+- before: accept any frame that looked available, even if it was not newer
+- after: accept only a frame with a higher frame number than the last one
+
+Code shorthand:
+
+`previous_frame_number` is the last frame number the reader already saw. We advance the counter ourselves in the camera process after a successful copy. The camera does not provide this number; our code creates it.
+
+The shared counter is created in [camera_capture.py](q:\RaspberryPi\camera_capture.py#L232) as 
+
+`self._frame_number = self._context.Value("L", 0, lock=False)`. 
+
+The camera process increases it with `frame_number.value += 1` after it copies a successful frame, and the reader checks `self._frame_number.value` to see whether a newer frame has arrived.
+
+```python
+# camera process: create a new frame number only after a successful read
+ok, frame = cap.read()
+if ok:
+    shared_frame[:, :, :] = frame
+    frame_number.value += 1
+
+# reader side: use the newest shared frame number
+current_frame_number = self._frame_number.value
+if current_frame_number > previous_frame_number:
+    return True
+```
 
 ## 5. The waiting felt uneven
 
 ### Clue or suspicion
 
-The camera and model were already separated more cleanly, but the app still had uneven delays. Because the problem was still happening after that split, we suspected the step that moved frames between the two processes.
+The camera and model were already separated more cleanly, but the app still had uneven delays. At first, we did not understand that frames could wait in more than one place, especially inside the webcam driver. We also wanted to check whether moving full images between our processes was adding its own delay.
 
 ### Analysis
 
-That made us look at the path where full frames moved between processes. A multiprocessing queue has to copy each image from one process to another, and that copying can add time and jitter.
+The camera driver buffer was investigated in the earlier one-frame-buffer test. Here, we looked at our own process-to-process path. The first process version handed off only one current frame at a time, so it did not keep a growing backlog. However, it still copied a full image between processes, and that copying could add time and jitter.
 
 ### Unsuccessful solutions
 
-- Passing full images through a queue as the main transport.
-- Keeping a backlog of older frames.
+- Copying full images between processes as the main transport.
+- Trying to solve the webcam driver's internal buffering from the application layer.
 
 ### Successful solution
 
-We changed the plan so the transport should carry only the newest frame, not a growing list of old ones. That set up the shared-memory fix in the next section.
+We changed the plan so the transport should carry only the newest frame and avoid unnecessary full-image copies. That set up the shared-memory fix in the next section.
 
 ## 6. The newest frame still lagged behind
 
 ### Clue or suspicion
 
-We still saw the newest frame arrive later than expected, even after the earlier camera and timeout fixes. That told us the new plan still needed a faster way to move one fresh frame forward.
+We still saw that the newest camera view could arrive later than expected. We first suspected that our own app might be retaining older frames. The investigation showed that the app handed off only one current frame at a time. The remaining source of older frames could be the webcam driver's internal buffer, which our code could not fully control.
 
 ### Analysis
 
-We looked at how full frames moved between processes again. The queue had to copy each image, so the newest frame could sit behind older work.
+We looked at how full frames moved between processes again. Even when only one frame was handed off, copying a large image between processes added work. We did not need a list of frames. The app needed the newest image available when processing was ready.
 
 ### Unsuccessful solutions
 
-- Passing full images through a queue as the main transport.
-- Keeping a backlog of older frames.
+- Copying full images between processes as the main transport.
+- Repeatedly copying large images between processes.
 
 ### Successful solution
 
 We switched to one shared-memory slot for the newest frame. The camera writes the latest image there, and the inference process reads it when ready.
 
-Old frames are replaced, not piled up, so there is less copying and less waiting.
+The shared-memory slot always holds the newest app-level frame. It avoids the repeated process-to-process image copy, and a new capture replaces the previous app-level frame.
 
 ## 7. The timings still did not add up
 
