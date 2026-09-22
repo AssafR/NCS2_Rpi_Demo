@@ -282,6 +282,139 @@ Use a heatsink, fan, and open airflow when demonstrating CPU inference for a
 long time. The NCS2/MYRIAD device reduces this thermal pressure because model
 inference happens outside the Raspberry Pi CPU.
 
+### USB Bandwidth Addendum
+
+The current webcam path uses 640x480 frames at about 5 FPS. If the camera sends
+raw YUYV video, the math is:
+
+```text
+640 x 480 = 307,200 pixels per frame
+YUYV = 2 bytes per pixel
+307,200 x 2 = 614,400 bytes per frame
+614,400 x 5 = 3,072,000 bytes per second
+```
+
+So the camera uses about 3.07 MB/s, or about 24.6 Mbit/s, before USB protocol
+overhead.
+
+On a Raspberry Pi 3, the USB ports use USB 2.0. USB 2.0 has a theoretical
+maximum of 480 Mbit/s, so this camera stream is only about 5% of that limit.
+Even if we compare it with a more realistic shared-bus throughput of roughly
+280 to 320 Mbit/s, the camera still uses only about 8% to 9% of the bus.
+
+That means the raw camera data rate is not large for USB 2.0. If the webcam is
+using MJPEG instead of raw YUYV, the USB bandwidth is even lower, because the
+camera sends compressed frames instead of full raw pixels.
+
+### Tensor Size And Bandwidth Summary
+
+The table below explains the model-side tensors, not the raw webcam pixels.
+The input tensor is what we send into the model. The output tensors are what
+the model sends back after inference.
+
+| Direction | Tensor shape(s) | Precision | Size per frame | Bandwidth at 5 FPS | Compared with USB 2.0 (480 Mbit/s) |
+| --- | --- | --- | ---: | ---: | ---: |
+| Input tensor | `1 x 3 x 256 x 456` | FP32 | `1,400,832 bytes` | `7.00 MB/s` = `56.0 Mbit/s` | `11.7%` |
+| Output tensors | `1 x 38 x 32 x 57` and `1 x 19 x 32 x 57` | FP32 | `415,872 bytes` | `2.08 MB/s` = `16.6 Mbit/s` | `3.5%` |
+
+#### How The Input Size Was Calculated
+
+The model input in `human-pose-estimation-0001.xml` is:
+
+```text
+1 x 3 x 256 x 456
+```
+
+That means:
+
+- `1` batch
+- `3` color channels
+- `256 x 456` pixels per frame
+- `FP32` precision, so each value uses `4 bytes`
+
+So the size per frame is:
+
+```text
+1 x 3 x 256 x 456 = 350,208 values
+350,208 x 4 bytes = 1,400,832 bytes per frame
+```
+
+At 5 FPS:
+
+```text
+1,400,832 x 5 = 7,004,160 bytes per second
+```
+
+That is about `7.00 MB/s` or `56.0 Mbit/s`.
+
+#### How The Output Size Was Calculated
+
+The model returns two output tensors:
+
+- one heatmap tensor with `38` maps at `32 x 57`
+- one heatmap tensor with `19` maps at `32 x 57`
+
+In both cases, the precision is `FP32`, so each value uses `4 bytes`.
+
+For the `38`-map output:
+
+```text
+1 x 38 x 32 x 57 = 69,312 values
+69,312 x 4 bytes = 277,248 bytes
+```
+
+For the `19`-map output:
+
+```text
+1 x 19 x 32 x 57 = 34,656 values
+34,656 x 4 bytes = 138,624 bytes
+```
+
+Total output size per frame:
+
+```text
+277,248 + 138,624 = 415,872 bytes per frame
+```
+
+At 5 FPS:
+
+```text
+415,872 x 5 = 2,079,360 bytes per second
+```
+
+That is about `2.08 MB/s` or `16.6 Mbit/s`.
+
+#### What This Means On A Raspberry Pi 3
+
+USB 2.0 has a theoretical maximum of `480 Mbit/s`. So:
+
+- the model input tensor is about `11.7%` of that limit at 5 FPS
+- the model output tensors are about `3.5%` of that limit at 5 FPS
+
+Together, the model input and output traffic are still much smaller than the
+full USB 2.0 bus. The main performance problem in this project is therefore
+not raw USB bandwidth alone. Camera buffering, CPU load, and thermal
+throttling can matter more.
+
+The webcam and the NCS2/MYRIAD device share the same USB 2.0 bus on a
+Raspberry Pi 3. This means we can also look at the whole USB path together:
+
+| USB path | Bandwidth at 5 FPS | Compared with USB 2.0 (480 Mbit/s) |
+| --- | ---: | ---: |
+| Webcam input from camera to Pi | `24.6 Mbit/s` | `5.1%` |
+| Model input from Pi to NCS2 | `56.0 Mbit/s` | `11.7%` |
+| Model output from NCS2 to Pi | `16.6 Mbit/s` | `3.5%` |
+| **Grand total (sum of rows above)** | **97.2 Mbit/s** | **20.3%** |
+
+So even when we add the camera stream and the model input/output traffic,
+the total is still only about one-fifth of USB 2.0 theoretical capacity.
+That is a useful reminder, but it is not the whole story: driver buffering,
+CPU scheduling, and thermal throttling can still slow the demo down.
+
+In Markdown tables, color and font size are not portable or reliable, so the
+best practice is usually a clear total label plus a short sentence right below
+the table. That keeps the summary obvious even in plain text renderers.
+
 ## Why Frames Have Numbers
 
 The camera runs in its own process. It keeps only the newest image, not a long
